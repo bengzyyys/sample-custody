@@ -35,11 +35,29 @@ type Sample struct {
 
 	// PendingTransfer 为该样品当前待确认交接的详情；没有待确认交接时为 nil。
 	PendingTransfer *TransferView `json:"pendingTransfer,omitempty"`
+
+	// Destruction 非空表示该样品已销毁，其中记录销毁操作人、地点、时间、
+	// 原因和实际销毁量；未销毁样品（包括剩余量因分装用尽而归零的样品）
+	// 一律为 nil。因此 Remaining 为 "0.000" 时可据此区分“分装用尽”与
+	// “已销毁”。
+	Destruction *Destruction `json:"destruction,omitempty"`
+}
+
+// Destruction 是样品销毁信息的对外只读视图。
+type Destruction struct {
+	// Operator 与 Location 为销毁时登记的操作人和地点，
+	// 与销毁前样品最后的持有人、地点一致。
+	Operator string    `json:"operator"`
+	Location string    `json:"location"`
+	At       time.Time `json:"at"`
+	Reason   string    `json:"reason"`
+	// Qty 为实际销毁量（销毁发生时该样品的全部剩余量），三位小数毫升。
+	Qty string `json:"qty"`
 }
 
 // History 是样品保管历史中的一条记录，按发生顺序追加。
 type History struct {
-	// Kind 为 "register"、"split"、"transfer-out" 或 "transfer-in"。
+	// Kind 为 "register"、"split"、"transfer-out"、"transfer-in" 或 "destroy"。
 	Kind string `json:"kind"`
 	// Time 是该事件发生的时间。分装没有独立的外部时间，沿用登记语义记为创建时刻。
 	Time time.Time `json:"time"`
@@ -85,6 +103,21 @@ type sampleRecord struct {
 	// PendingID 非空时指向 transfers 中一条尚未确认的交接；
 	// 同一样品任意时刻至多存在一条待确认交接。
 	PendingID string `json:"pendingId,omitempty"`
+
+	// Destroyed 非空时表示样品已销毁，记录销毁操作人、地点、时间、原因
+	// 与实际销毁量。旧数据没有该字段（nil）的样品一律视为未销毁，
+	// 即使 Remaining 为零也不能据此推断为销毁。
+	Destroyed *destructionRecord `json:"destroyed,omitempty"`
+}
+
+// destructionRecord 是销毁信息的内部持久化模型。销毁只处理样品当时的
+// 全部剩余量，Qty 保存当时销毁的千分之一毫升整数。
+type destructionRecord struct {
+	Operator string    `json:"operator"`
+	Location string    `json:"location"`
+	At       time.Time `json:"at"`
+	Reason   string    `json:"reason"`
+	Qty      int64     `json:"qty"`
 }
 
 type historyRecord struct {
@@ -136,6 +169,10 @@ func (l *ledger) deepCopy() *ledger {
 		sc.Children = append([]string(nil), s.Children...)
 		sc.History = make([]historyRecord, len(s.History))
 		copy(sc.History, s.History)
+		if s.Destroyed != nil {
+			dc := *s.Destroyed
+			sc.Destroyed = &dc
+		}
 		cp.Samples[id] = &sc
 	}
 	for id, t := range l.Transfers {

@@ -234,6 +234,9 @@ func (s *Store) Split(in SplitInput) (*Sample, error) {
 		}
 	}
 
+	if parent.Destroyed != nil {
+		return nil, fmt.Errorf("%w: 样品 %q 已销毁，不能再分装", ErrConflict, parentID)
+	}
 	if parent.PendingID != "" {
 		return nil, fmt.Errorf("%w: 样品 %q 存在待确认交接 %s，不能分装",
 			ErrConflict, parentID, parent.PendingID)
@@ -353,6 +356,9 @@ func (s *Store) Handover(in HandoverInput) (*TransferView, error) {
 	sample, ok := s.data.Samples[sampleID]
 	if !ok {
 		return nil, fmt.Errorf("%w: 样品 %q 不存在", ErrNotFound, sampleID)
+	}
+	if sample.Destroyed != nil {
+		return nil, fmt.Errorf("%w: 样品 %q 已销毁，不能发起新的交接", ErrConflict, sampleID)
 	}
 	if sample.Remaining == 0 {
 		return nil, fmt.Errorf("%w: 样品 %q 剩余量为零，不能发起交接", ErrConflict, sampleID)
@@ -503,6 +509,126 @@ func (s *Store) Confirm(in ConfirmInput) (*TransferView, error) {
 	return buildTransferView(cp), nil
 }
 
+// DestroyInput 是销毁样品全部剩余量的入参；销毁不接受部分销毁。
+type DestroyInput struct {
+	// SampleID 为样品编号。
+	SampleID string
+	// Operator 为操作人，去空白后必须与样品当前持有人一致。
+	Operator string
+	// Location 为销毁所在地点，去空白后必须与样品当前地点一致。
+	Location string
+	// At 为销毁时间，不能为零，也不能早于该样品任何已有保管历史的时间。
+	At time.Time
+	// Reason 为销毁原因，去空白后非空。
+	Reason string
+}
+
+// Destroy 销毁该编号样品当时的全部剩余量（不接受部分销毁）。成功后
+// 剩余量变为 0.000，初始量、来源关系、子样列表与原有保管历史保留，
+// 持有人和地点保留为销毁前的最后记录，并在保管历史末尾追加一次销毁
+// 事件；返回该样品的最新查询结果。
+//
+// 已销毁样品重复提交完全相同的操作人、地点、时间和原因时，返回原销毁
+// 结果且不再追加历史；文本按去首尾空白后的内容比较，时间按实际时刻
+// 比较。任一项不同则返回 ErrConflict，不覆盖原记录。
+func (s *Store) Destroy(in DestroyInput) (*Sample, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sampleID, err := trimRequired("样品编号", in.SampleID)
+	if err != nil {
+		return nil, err
+	}
+	operator, err := trimRequired("操作人", in.Operator)
+	if err != nil {
+		return nil, err
+	}
+	location, err := trimRequired("所在地点", in.Location)
+	if err != nil {
+		return nil, err
+	}
+	reason, err := trimRequired("销毁原因", in.Reason)
+	if err != nil {
+		return nil, err
+	}
+	if in.At.IsZero() {
+		return nil, fmt.Errorf("%w: 销毁时间不能为空", ErrInvalid)
+	}
+	at := in.At.UTC()
+
+	rec, ok := s.data.Samples[sampleID]
+	if !ok {
+		return nil, fmt.Errorf("%w: 样品 %q 不存在", ErrNotFound, sampleID)
+	}
+
+	// 已销毁：只接受与首次销毁完全相同的重复提交，原样返回且不再追加历史。
+	if rec.Destroyed != nil {
+		if !sameDestruction(rec.Destroyed, operator, location, at, reason) {
+			return nil, fmt.Errorf("%w: 样品 %q 已销毁，本次销毁信息与原销毁记录不一致",
+				ErrConflict, sampleID)
+		}
+		return buildSampleView(rec, s.data), nil
+	}
+
+	// 未销毁样品的状态冲突（持有人/地点不匹配按入参语义归入冲突类）。
+	if operator != rec.Holder {
+		return nil, fmt.Errorf("%w: 操作人 %q 与样品 %q 当前持有人 %q 不一致",
+			ErrConflict, operator, sampleID, rec.Holder)
+	}
+	if location != rec.Location {
+		return nil, fmt.Errorf("%w: 销毁地点 %q 与样品 %q 当前地点 %q 不一致",
+			ErrConflict, location, sampleID, rec.Location)
+	}
+	if rec.PendingID != "" {
+		return nil, fmt.Errorf("%w: 样品 %q 存在待确认交接 %s，不能销毁",
+			ErrConflict, sampleID, rec.PendingID)
+	}
+	if rec.Remaining == 0 {
+		return nil, fmt.Errorf("%w: 样品 %q 剩余量已为零且未销毁，不能再销毁",
+			ErrConflict, sampleID)
+	}
+	for _, h := range rec.History {
+		if at.Before(h.Time) {
+			return nil, fmt.Errorf("%w: 销毁时间不能早于样品 %q 已有保管历史的时间 %s",
+				ErrInvalid, sampleID, h.Time.Format(time.RFC3339))
+		}
+	}
+
+	candidate := s.data.deepCopy()
+	cp := candidate.Samples[sampleID]
+	destroyedQty := cp.Remaining
+	cp.Remaining = 0
+	cp.Destroyed = &destructionRecord{
+		Operator: operator,
+		Location: location,
+		At:       at,
+		Reason:   reason,
+		Qty:      destroyedQty,
+	}
+	// 持有人和地点保留为销毁前的最后记录，仅在历史末尾追加销毁事件。
+	cp.History = append(cp.History, historyRecord{
+		Kind:     "destroy",
+		Time:     at,
+		Holder:   operator,
+		Location: location,
+		Detail:   fmt.Sprintf("销毁全部剩余量 %s 毫升，原因：%s", formatUnits(destroyedQty), reason),
+	})
+
+	if err := s.commit(candidate); err != nil {
+		return nil, err
+	}
+	return buildSampleView(cp, candidate), nil
+}
+
+// sameDestruction 判断本次销毁请求与已有销毁记录是否完全相同。
+// 文本字段均已去首尾空白，时间按实际时刻（Equal）比较。
+func sameDestruction(d *destructionRecord, operator, location string, at time.Time, reason string) bool {
+	return d.Operator == operator &&
+		d.Location == location &&
+		d.At.Equal(at) &&
+		d.Reason == reason
+}
+
 // GetSample 按样品编号查询：返回来源关系、初始量/剩余量、当前持有人和
 // 地点、直接子样、按发生顺序排列的保管历史，以及待确认交接详情。
 // 样品不存在时返回包装了 ErrNotFound 的错误，不会创建任何记录。
@@ -564,6 +690,15 @@ func buildSampleView(r *sampleRecord, l *ledger) *Sample {
 	if r.PendingID != "" {
 		if t, ok := l.Transfers[r.PendingID]; ok {
 			v.PendingTransfer = buildTransferView(t)
+		}
+	}
+	if r.Destroyed != nil {
+		v.Destruction = &Destruction{
+			Operator: r.Destroyed.Operator,
+			Location: r.Destroyed.Location,
+			At:       r.Destroyed.At,
+			Reason:   r.Destroyed.Reason,
+			Qty:      formatUnits(r.Destroyed.Qty),
 		}
 	}
 	return v
