@@ -238,6 +238,9 @@ func (s *Store) Split(in SplitInput) (*Sample, error) {
 		return nil, fmt.Errorf("%w: 样品 %q 存在待确认交接 %s，不能分装",
 			ErrConflict, parentID, parent.PendingID)
 	}
+	if parent.Destroyed != nil {
+		return nil, fmt.Errorf("%w: 样品 %q 已销毁，不能分装", ErrConflict, parentID)
+	}
 	if parent.Remaining == 0 {
 		return nil, fmt.Errorf("%w: 样品 %q 剩余量为零，不能再分装", ErrConflict, parentID)
 	}
@@ -284,6 +287,120 @@ func (s *Store) Split(in SplitInput) (*Sample, error) {
 		return nil, err
 	}
 	return buildSampleView(cpParent, candidate), nil
+}
+
+// DestroyInput 是销毁全部剩余量的入参。销毁不接受部分销毁：实际销毁量
+// 由样品在销毁时刻的剩余量决定。
+type DestroyInput struct {
+	// SampleID 为要销毁的样品编号，去空白后非空。
+	SampleID string
+	// Operator 为销毁操作人，去空白后必须与样品当前持有人一致。
+	Operator string
+	// Location 为销毁地点，去空白后必须与样品当前地点一致。
+	Location string
+	// DestroyedAt 为销毁时间，不能为零，也不能早于该样品任何已有保管
+	// 历史的时间（相同时间可以接受）。
+	DestroyedAt time.Time
+	// Reason 为销毁原因，去空白后非空。
+	Reason string
+}
+
+// Destroy 销毁样品在销毁时刻的全部剩余量。成功后剩余量变为 0.000，初始量、
+// 来源关系、子样列表与原有保管历史保留，持有人和地点保留为销毁前的最后
+// 记录，并在保管历史末尾追加一次销毁事件；父样与子样的销毁各自独立。
+//
+// 销毁记录长期有效：已销毁样品不得再分装或发起新的交接。同一样品已销毁后，
+// 重复提交与首次成功操作完全相同的人员、地点、时间和原因时返回原销毁结果，
+// 不再追加历史；任一内容不同都拒绝，且不覆盖原记录。
+func (s *Store) Destroy(in DestroyInput) (*Sample, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sampleID, err := trimRequired("样品编号", in.SampleID)
+	if err != nil {
+		return nil, err
+	}
+	operator, err := trimRequired("操作人", in.Operator)
+	if err != nil {
+		return nil, err
+	}
+	location, err := trimRequired("地点", in.Location)
+	if err != nil {
+		return nil, err
+	}
+	reason, err := trimRequired("原因", in.Reason)
+	if err != nil {
+		return nil, err
+	}
+	if in.DestroyedAt.IsZero() {
+		return nil, fmt.Errorf("%w: 销毁时间不能为空", ErrInvalid)
+	}
+	destroyedAt := in.DestroyedAt.UTC()
+
+	rec, ok := s.data.Samples[sampleID]
+	if !ok {
+		return nil, fmt.Errorf("%w: 样品 %q 不存在", ErrNotFound, sampleID)
+	}
+
+	// 已销毁样品的重复提交：人员、地点、时间、原因与原销毁记录完全一致
+	// 才返回原结果，不追加历史；任一项不同都拒绝，且不覆盖原记录。
+	if rec.Destroyed != nil {
+		same := rec.Destroyed.Operator == operator &&
+			rec.Destroyed.Location == location &&
+			rec.Destroyed.Reason == reason &&
+			rec.Destroyed.Time.Equal(destroyedAt)
+		if !same {
+			return nil, fmt.Errorf("%w: 样品 %q 已销毁，销毁信息与原记录不一致",
+				ErrConflict, sampleID)
+		}
+		return buildSampleView(rec, s.data), nil
+	}
+
+	if rec.PendingID != "" {
+		return nil, fmt.Errorf("%w: 样品 %q 存在待确认交接 %s，不能销毁",
+			ErrConflict, sampleID, rec.PendingID)
+	}
+	if rec.Remaining == 0 {
+		return nil, fmt.Errorf("%w: 样品 %q 剩余量为零，不能销毁", ErrConflict, sampleID)
+	}
+	if rec.Holder != operator {
+		return nil, fmt.Errorf("%w: 销毁操作人 %q 与样品 %q 当前持有人 %q 不一致",
+			ErrConflict, operator, sampleID, rec.Holder)
+	}
+	if rec.Location != location {
+		return nil, fmt.Errorf("%w: 销毁地点 %q 与样品 %q 当前地点 %q 不一致",
+			ErrConflict, location, sampleID, rec.Location)
+	}
+	for _, h := range rec.History {
+		if destroyedAt.Before(h.Time) {
+			return nil, fmt.Errorf("%w: 销毁时间 %s 不能早于样品 %q 已有保管历史时间 %s",
+				ErrInvalid, destroyedAt.Format(time.RFC3339), sampleID, h.Time.Format(time.RFC3339))
+		}
+	}
+
+	candidate := s.data.deepCopy()
+	cp := candidate.Samples[sampleID]
+	destroyedQty := cp.Remaining
+	cp.Remaining = 0
+	cp.Destroyed = &destructionRecord{
+		Operator: operator,
+		Location: location,
+		Time:     destroyedAt,
+		Reason:   reason,
+		Qty:      destroyedQty,
+	}
+	cp.History = append(cp.History, historyRecord{
+		Kind:     "destroy",
+		Time:     destroyedAt,
+		Holder:   operator,
+		Location: location,
+		Detail:   fmt.Sprintf("销毁剩余量 %s 毫升，原因：%s", formatUnits(destroyedQty), reason),
+	})
+
+	if err := s.commit(candidate); err != nil {
+		return nil, err
+	}
+	return buildSampleView(cp, candidate), nil
 }
 
 // HandoverInput 是发起交接（交出）的入参。
@@ -353,6 +470,9 @@ func (s *Store) Handover(in HandoverInput) (*TransferView, error) {
 	sample, ok := s.data.Samples[sampleID]
 	if !ok {
 		return nil, fmt.Errorf("%w: 样品 %q 不存在", ErrNotFound, sampleID)
+	}
+	if sample.Destroyed != nil {
+		return nil, fmt.Errorf("%w: 样品 %q 已销毁，不能发起交接", ErrConflict, sampleID)
 	}
 	if sample.Remaining == 0 {
 		return nil, fmt.Errorf("%w: 样品 %q 剩余量为零，不能发起交接", ErrConflict, sampleID)
@@ -564,6 +684,16 @@ func buildSampleView(r *sampleRecord, l *ledger) *Sample {
 	if r.PendingID != "" {
 		if t, ok := l.Transfers[r.PendingID]; ok {
 			v.PendingTransfer = buildTransferView(t)
+		}
+	}
+	if r.Destroyed != nil {
+		d := *r.Destroyed
+		v.Destruction = &Destruction{
+			Operator:    d.Operator,
+			Location:    d.Location,
+			DestroyedAt: d.Time,
+			Reason:      d.Reason,
+			Qty:         formatUnits(d.Qty),
 		}
 	}
 	return v

@@ -1,7 +1,7 @@
 // Package custody 是本地样品流转与保管链。
 //
 // 一份本地样品数据由 [Store] 表示，通过 [Open] 创建或重新打开；所有
-// 登记、分装、交接与查询都通过 Store 的公开方法完成。数据以 JSON
+// 登记、分装、交接、销毁与查询都通过 Store 的公开方法完成。数据以 JSON
 // 原子落盘，关闭后用同一文件路径重新 [Open] 即可恢复全部样品、保管
 // 历史以及交接编号的重复提交判断。
 //
@@ -27,6 +27,11 @@
 //		HandedOverAt: handoverTime,
 //	})
 //	s.Confirm(custody.ConfirmInput{TransferID: "TR-001", Receiver: "李四", AtLocation: "实验室B", ReceivedAt: receiveTime})
+//	// 销毁该样品当时的全部剩余量（不接受部分销毁）
+//	view, _ := s.Destroy(custody.DestroyInput{
+//		SampleID: "S-001", Operator: "张三", Location: "实验室A",
+//		DestroyedAt: destroyTime, Reason: "实验剩余样品销毁",
+//	})
 //	// 查询
 //	view, _ := s.GetSample("S-001")
 //	transfer, _ := s.GetTransfer("TR-001")
