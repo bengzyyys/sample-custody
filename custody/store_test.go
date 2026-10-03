@@ -1,7 +1,9 @@
 package custody
 
 import (
+	"bytes"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -557,5 +559,230 @@ func TestNotFoundDoesNotCreate(t *testing.T) {
 	}
 	if len(s.data.Samples) != 0 || len(s.data.Transfers) != 0 {
 		t.Fatalf("查询不存在的记录不得创建数据")
+	}
+}
+
+// TestConfirmSaveFailureKeepsPendingState 固定确认阶段保存失败的行为：
+// 接收信息完全合法但本地样品数据无法保存时，确认必须返回保存错误而不是
+// 成功结果，样品的保管状态与待确认交接保持确认前原样；恢复可保存后，
+// 同一份接收信息可以完成确认，且之后的重复确认幂等。
+func TestConfirmSaveFailureKeepsPendingState(t *testing.T) {
+	hAt := time.Date(2026, 10, 2, 10, 0, 0, 0, time.UTC)
+	rAt := hAt.Add(time.Hour)
+
+	// 两种保存失败：数据目录无法写入（临时文件建不出来），
+	// 以及既有数据文件无法被新内容替换（rename 失败）。
+	disruptors := []struct {
+		name    string
+		disrupt func(t *testing.T, dir, dataPath string) (restore func())
+	}{
+		{
+			name: "数据目录无法写入",
+			disrupt: func(t *testing.T, dir, dataPath string) func() {
+				t.Helper()
+				hidden := dir + "-hidden"
+				if err := os.Rename(dir, hidden); err != nil {
+					t.Fatalf("挪开数据目录: %v", err)
+				}
+				// 原目录路径变成普通文件后，数据目录不可写。
+				if err := os.WriteFile(dir, []byte("blocked"), 0o644); err != nil {
+					t.Fatalf("占用目录路径: %v", err)
+				}
+				return func() {
+					_ = os.Remove(dir)
+					if err := os.Rename(hidden, dir); err != nil {
+						t.Errorf("恢复数据目录: %v", err)
+					}
+				}
+			},
+		},
+		{
+			name: "既有数据文件无法替换",
+			disrupt: func(t *testing.T, dir, dataPath string) func() {
+				t.Helper()
+				backup := dataPath + ".bak"
+				if err := os.Rename(dataPath, backup); err != nil {
+					t.Fatalf("挪开数据文件: %v", err)
+				}
+				// 数据文件路径被目录占用后，临时文件可建但无法替换目标。
+				if err := os.Mkdir(dataPath, 0o755); err != nil {
+					t.Fatalf("占用数据文件路径: %v", err)
+				}
+				return func() {
+					_ = os.Remove(dataPath)
+					if err := os.Rename(backup, dataPath); err != nil {
+						t.Errorf("恢复数据文件: %v", err)
+					}
+				}
+			},
+		},
+	}
+
+	for _, d := range disruptors {
+		t.Run(d.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dataPath := filepath.Join(dir, "data.json")
+			s, err := Open(dataPath)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			clock := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+			s.now = func() time.Time { return clock }
+
+			mustRegister(t, s, "P", "4.250", "张三", "实验室A")
+			if _, err := s.Handover(HandoverInput{
+				TransferID: "TR-1", SampleID: "P",
+				FromHolder: "张三", FromLocation: "实验室A",
+				ToHolder: "李四", ToLocation: "实验室B",
+				HandedOverAt: hAt,
+			}); err != nil {
+				t.Fatalf("handover: %v", err)
+			}
+
+			// 确认前基线：待确认交接已成功保存，样品仍在交出地点由交出人持有。
+			before, err := s.GetSample("P")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if before.PendingTransfer == nil || before.PendingTransfer.TransferID != "TR-1" {
+				t.Fatalf("确认前应存在待确认交接 TR-1: %+v", before.PendingTransfer)
+			}
+			savedBytes, err := os.ReadFile(dataPath)
+			if err != nil {
+				t.Fatalf("读取已保存数据: %v", err)
+			}
+
+			// 接收信息本身完全合法：指定接收人、目的地点、不早于交出时间。
+			confirm := ConfirmInput{
+				TransferID: "TR-1", Receiver: "李四",
+				AtLocation: "实验室B", ReceivedAt: rAt,
+			}
+
+			restore := d.disrupt(t, dir, dataPath)
+
+			// 保存失败：返回错误，且不得误报为入参不合法或状态冲突。
+			if _, err := s.Confirm(confirm); err == nil {
+				t.Fatal("保存失败时确认不得返回表示接收成功的结果")
+			} else if errors.Is(err, ErrInvalid) || errors.Is(err, ErrConflict) {
+				t.Fatalf("保存失败不得误报为入参/状态错误, got %v", err)
+			}
+
+			// 按样品编号和交接编号查询，都必须看到确认前的状态。
+			assertPendingStateUnchanged(t, s, before)
+
+			// 待确认限制仍然生效：不能分装，也不能另发起一条交接。
+			if _, err := s.Split(SplitInput{ParentID: "P", Parts: []SplitPart{{ID: "C", Qty: "0.001"}}}); !errors.Is(err, ErrConflict) {
+				t.Fatalf("保存失败后待确认期间分装仍应拒绝, got %v", err)
+			}
+			if _, err := s.Handover(HandoverInput{
+				TransferID: "TR-2", SampleID: "P",
+				FromHolder: "张三", FromLocation: "实验室A",
+				ToHolder: "王五", ToLocation: "实验室C",
+				HandedOverAt: hAt,
+			}); !errors.Is(err, ErrConflict) {
+				t.Fatalf("保存失败后待确认期间另发交接仍应拒绝, got %v", err)
+			}
+			// 被拒绝的操作不得影响原交接。
+			assertPendingStateUnchanged(t, s, before)
+
+			// 恢复正常文件访问：此前保存的数据文件内容保持原样。
+			restore()
+			currentBytes, err := os.ReadFile(dataPath)
+			if err != nil {
+				t.Fatalf("恢复后读取数据文件: %v", err)
+			}
+			if !bytes.Equal(savedBytes, currentBytes) {
+				t.Fatal("保存失败不得改动已保存的数据文件内容")
+			}
+
+			// 重新打开：同一条待确认交接和原来的保管位置仍在。
+			s2, err := Open(dataPath)
+			if err != nil {
+				t.Fatalf("恢复后重新打开: %v", err)
+			}
+			reopened, err := s2.GetSample("P")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reopened.Holder != "张三" || reopened.Location != "实验室A" ||
+				reopened.PendingTransfer == nil || reopened.PendingTransfer.TransferID != "TR-1" {
+				t.Fatalf("重开后应仍看到原待确认交接与保管位置: %+v", reopened)
+			}
+
+			// 数据重新可以正常保存：同一份接收信息确认成功。
+			done, err := s2.Confirm(confirm)
+			if err != nil {
+				t.Fatalf("恢复后同一接收信息应确认成功: %v", err)
+			}
+			if !done.Confirmed || done.ReceivedAt == nil || !done.ReceivedAt.Equal(rAt) {
+				t.Fatalf("确认结果应保留提交的接收时间: %+v", done)
+			}
+			after, err := s2.GetSample("P")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Holder != "李四" || after.Location != "实验室B" || after.PendingTransfer != nil {
+				t.Fatalf("确认后持有人地点应变更、待确认详情消失: %+v", after)
+			}
+			if len(after.History) != len(before.History)+1 ||
+				after.History[len(after.History)-1].Kind != "transfer-in" {
+				t.Fatalf("样品历史应只增加一条接收记录: %+v", after.History)
+			}
+			tr, err := s2.GetTransfer("TR-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tr.Confirmed || tr.ConfirmedBy != "李四" ||
+				tr.ReceivedAt == nil || !tr.ReceivedAt.Equal(rAt) {
+				t.Fatalf("交接查询应显示已确认并保留接收时间: %+v", tr)
+			}
+
+			// 相同信息的重复确认：返回原结果，不再追加记录。
+			again, err := s2.Confirm(confirm)
+			if err != nil {
+				t.Fatalf("重复确认应返回原结果: %v", err)
+			}
+			if !again.Confirmed || again.ReceivedAt == nil || !again.ReceivedAt.Equal(rAt) {
+				t.Fatalf("重复确认应返回原确认结果: %+v", again)
+			}
+			final, _ := s2.GetSample("P")
+			if len(final.History) != len(after.History) {
+				t.Fatalf("重复确认不得追加历史: before=%d after=%d",
+					len(after.History), len(final.History))
+			}
+		})
+	}
+}
+
+// assertPendingStateUnchanged 断言样品与待确认交接仍保持 before 记录的
+// 确认前状态：持有人、地点、剩余量和原有历史不变，待确认详情仍指向同一
+// 条交接；交接仍未确认，没有接收时间和确认人。
+func assertPendingStateUnchanged(t *testing.T, s *Store, before *Sample) {
+	t.Helper()
+	got, err := s.GetSample(before.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Holder != before.Holder || got.Location != before.Location ||
+		got.Remaining != before.Remaining {
+		t.Fatalf("保管状态被改动: before=%+v after=%+v", before, got)
+	}
+	if len(got.History) != len(before.History) {
+		t.Fatalf("历史被改动: before=%d after=%d", len(before.History), len(got.History))
+	}
+	for i := range before.History {
+		if got.History[i] != before.History[i] {
+			t.Fatalf("历史第 %d 条被改动: before=%+v after=%+v", i, before.History[i], got.History[i])
+		}
+	}
+	if got.PendingTransfer == nil || got.PendingTransfer.TransferID != before.PendingTransfer.TransferID {
+		t.Fatalf("待确认详情应仍指向同一条交接: %+v", got.PendingTransfer)
+	}
+	tr, err := s.GetTransfer(before.PendingTransfer.TransferID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.Confirmed || tr.ReceivedAt != nil || tr.ConfirmedBy != "" {
+		t.Fatalf("交接应保持未确认、无接收时间和确认人: %+v", tr)
 	}
 }
