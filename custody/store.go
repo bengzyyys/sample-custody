@@ -66,16 +66,20 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// validateRestored 校验从文件恢复的数据中待确认交接关联是否一致。
+// validateRestored 校验从文件恢复的数据中交接关联是否一致。
 // 样品的非空 pendingId 必须指向一条实际存在、尚未确认、且属于该样品的
 // 交接；每条尚未确认的交接也必须对应一份实际存在、且 pendingId 正好指向
 // 它的样品。待确认交接表示样品当前全部剩余量尚待指定人员接收，因此其
 // 内容还必须与样品当前记录一致：样品未销毁、剩余量大于零、交出人等于
-// 当前持有人、交出地点等于当前地点、交接量精确等于当前剩余量。已确认
-// 交接属于保留的历史，不要求样品继续指向它，也不核对其与样品当前
-// 持有人、地点或剩余量的差异。集合中占用编号却为 null 的条目视为
-// 损坏，不能当作记录不存在。任一问题都使整个文件无法恢复，绝不只
-// 加载其中一部分，也不改动原文件。
+// 当前持有人、交出地点等于当前地点、交接量精确等于当前剩余量。
+//
+// 已确认交接属于保留的历史，不要求样品继续指向它，也不核对其与样品当前
+// 持有人、地点或剩余量的差异（样品后来分装、移动或销毁都不能否定当时的
+// 接收事实）；但它必须保留有效的接收信息：确认人非空且与该交接原先指定
+// 的接收人一致，接收时间存在且非零，且按实际时刻不早于交出时间（恰好
+// 相等合法，时区只影响表示）。集合中占用编号却为 null 的条目视为损坏，
+// 不能当作记录不存在。任一问题都使整个文件无法恢复，绝不只加载其中
+// 一部分，也不改动原文件。
 func validateRestored(l *ledger) error {
 	sampleIDs := make([]string, 0, len(l.Samples))
 	for id := range l.Samples {
@@ -121,6 +125,9 @@ func validateRestored(l *ledger) error {
 			return fmt.Errorf("%w: 交接编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
 		}
 		if rec.Confirmed {
+			if err := validateConfirmedReceipt(rec); err != nil {
+				return err
+			}
 			continue
 		}
 		sample, ok := l.Samples[rec.SampleID]
@@ -166,6 +173,41 @@ func validatePendingContent(sampleID string, sample *sampleRecord, tr *transferR
 	case tr.Qty != sample.Remaining:
 		return fmt.Errorf("%w: 样品 %q 的待确认交接 %q 的交接量 %s 毫升与样品当前剩余量 %s 毫升不一致，无法恢复",
 			ErrInvalid, sampleID, tr.ID, formatUnits(tr.Qty), formatUnits(sample.Remaining))
+	}
+	return nil
+}
+
+// validateConfirmedReceipt 核对一条已确认交接是否保留了有效的接收事实。
+// 已确认表示样品确实完成过一次转手，因此确认人必须非空（去首尾空白后）
+// 且与该交接原先指定的接收人完全一致，接收时间必须存在且不是零时间，
+// 并按实际时刻不早于交出时间（恰好相等合法；不同时区表示同一时刻也算
+// 相等，时间倒置用 Before 判断而非比较时区偏移后的字面值）。任一不符
+// 都返回包装了 ErrInvalid 的错误，信息写明交接编号、关联样品编号以及
+// 具体问题（缺少/空白确认人、确认人不符、缺少或零值接收时间、时间倒置），
+// 绝不靠补写确认人、猜测接收时间或改回待确认来接受异常记录。
+func validateConfirmedReceipt(tr *transferRecord) error {
+	switch {
+	case tr.ConfirmedBy == "":
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）缺少确认人，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID)
+	case strings.TrimSpace(tr.ConfirmedBy) == "":
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的确认人不能只有空白，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID)
+	case tr.ConfirmedBy != tr.ToHolder:
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的确认人 %q 与原定接收人 %q 不一致，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID, tr.ConfirmedBy, tr.ToHolder)
+	}
+	switch {
+	case tr.ReceivedAt == nil:
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）缺少接收时间，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID)
+	case tr.ReceivedAt.IsZero():
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的接收时间为零值，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID)
+	case tr.ReceivedAt.Before(tr.HandedOverAt):
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的接收时间 %s 早于交出时间 %s，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID,
+			tr.ReceivedAt.Format(time.RFC3339), tr.HandedOverAt.Format(time.RFC3339))
 	}
 	return nil
 }
