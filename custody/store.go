@@ -66,9 +66,14 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// validateRestored 校验从文件恢复的数据中销毁数量与交接关联是否一致。
+// validateRestored 校验从文件恢复的数据中样品数量、销毁数量与交接关联是否一致。
 //
-// 每个样品先核对待确认交接，再核对销毁数量：已销毁样品仍挂着待确认交接
+// 每份未销毁样品先核对自身数量（见 validateUndestroyedQuantity）：初始量
+// 必须大于零，剩余量可以为零，但不能为负或超过自身初始量。登记的原样与
+// 分装产生的子样适用同一规则，子样的上限是它自己创建时取得的初始量，与
+// 父样或其他样品的量无关；样品是否挂着待确认交接也不影响这项检查。
+//
+// 每个样品再核对待确认交接，最后核对销毁数量：已销毁样品仍挂着待确认交接
 // 本身就是损坏，沿用原有的交接恢复报错。
 //
 // 对带有销毁信息的样品，逐一核对数量守恒（见 validateDestroyedQuantity）：
@@ -104,6 +109,14 @@ func validateRestored(l *ledger) error {
 		rec := l.Samples[id]
 		if rec == nil {
 			return fmt.Errorf("%w: 样品编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
+		}
+		// 未销毁样品的数量自检放在待确认交接核对之前：是否存在待确认
+		// 交接不影响这项检查，即使交接量恰好等于越界的剩余量，也不能
+		// 因此接受数量矛盾的样品。
+		if rec.Destroyed == nil {
+			if err := validateUndestroyedQuantity(id, rec); err != nil {
+				return err
+			}
 		}
 		if rec.PendingID != "" {
 			tr, ok := l.Transfers[rec.PendingID]
@@ -166,6 +179,33 @@ func validateRestored(l *ledger) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// validateUndestroyedQuantity 核对一份未销毁样品记录的自身数量是否合理。
+// 未销毁样品（含剩余量因分装用尽而归零的旧记录）必须满足：
+//   - 初始量大于零；
+//   - 剩余量不为负；
+//   - 剩余量不超过自身初始量。
+//
+// 该规则对登记的原样和分装产生的子样一视同仁：子样的上限是它自己创建时
+// 取得的初始量，不能借用父样或其他样品的量。这里只核对样品自身记录，不
+// 因存在内容一致的待确认交接而放宽，也不把剩余量改成零或初始量来接受
+// 文件。任一不符都返回包装了 ErrInvalid 的错误，信息写明样品编号、违反
+// 的数量规则，相关数量统一按三位小数毫升展示；极端负数量也照常格式化，
+// 不会在说明非法数量时异常退出。
+func validateUndestroyedQuantity(sampleID string, rec *sampleRecord) error {
+	switch {
+	case rec.Initial <= 0:
+		return fmt.Errorf("%w: 样品 %q 未销毁但初始量为 %s 毫升，初始量必须大于零，无法恢复",
+			ErrInvalid, sampleID, formatUnits(rec.Initial))
+	case rec.Remaining < 0:
+		return fmt.Errorf("%w: 样品 %q 未销毁但剩余量为 %s 毫升，剩余量不能为负，无法恢复",
+			ErrInvalid, sampleID, formatUnits(rec.Remaining))
+	case rec.Remaining > rec.Initial:
+		return fmt.Errorf("%w: 样品 %q 未销毁但剩余量 %s 毫升超过自身初始量 %s 毫升，无法恢复",
+			ErrInvalid, sampleID, formatUnits(rec.Remaining), formatUnits(rec.Initial))
 	}
 	return nil
 }
