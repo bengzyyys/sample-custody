@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,9 @@ func Open(path string) (*Store, error) {
 		if l.Transfers == nil {
 			l.Transfers = make(map[string]*transferRecord)
 		}
+		if err := validateRestored(&l); err != nil {
+			return nil, err
+		}
 		s.data = &l
 	case os.IsNotExist(err):
 		s.data = newLedger()
@@ -60,6 +64,73 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("打开本地样品数据 %s 失败: %w", path, err)
 	}
 	return s, nil
+}
+
+// validateRestored 校验从文件恢复的数据中待确认交接关联是否一致。
+// 样品的非空 pendingId 必须指向一条实际存在、尚未确认、且属于该样品的
+// 交接；每条尚未确认的交接也必须对应一份实际存在、且 pendingId 正好指向
+// 它的样品。已确认交接属于保留的历史，不要求样品继续指向它，也不核对
+// 其与样品当前持有人、地点或剩余量的差异。集合中占用编号却为 null 的
+// 条目视为损坏，不能当作记录不存在。任一问题都使整个文件无法恢复，
+// 绝不只加载其中一部分，也不改动原文件。
+func validateRestored(l *ledger) error {
+	sampleIDs := make([]string, 0, len(l.Samples))
+	for id := range l.Samples {
+		sampleIDs = append(sampleIDs, id)
+	}
+	sort.Strings(sampleIDs)
+	for _, id := range sampleIDs {
+		rec := l.Samples[id]
+		if rec == nil {
+			return fmt.Errorf("%w: 样品编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
+		}
+		if rec.PendingID == "" {
+			continue
+		}
+		tr, ok := l.Transfers[rec.PendingID]
+		switch {
+		case !ok:
+			return fmt.Errorf("%w: 样品 %q 记着待确认交接 %q，但该交接不存在，无法恢复",
+				ErrInvalid, id, rec.PendingID)
+		case tr == nil:
+			return fmt.Errorf("%w: 样品 %q 记着待确认交接 %q，但该交接记录为 null，无法恢复",
+				ErrInvalid, id, rec.PendingID)
+		case tr.Confirmed:
+			return fmt.Errorf("%w: 样品 %q 记着的交接 %q 已确认，不能仍是待确认，无法恢复",
+				ErrInvalid, id, rec.PendingID)
+		case tr.SampleID != id:
+			return fmt.Errorf("%w: 样品 %q 记着的待确认交接 %q 属于样品 %q，无法恢复",
+				ErrInvalid, id, rec.PendingID, tr.SampleID)
+		}
+	}
+
+	transferIDs := make([]string, 0, len(l.Transfers))
+	for id := range l.Transfers {
+		transferIDs = append(transferIDs, id)
+	}
+	sort.Strings(transferIDs)
+	for _, id := range transferIDs {
+		rec := l.Transfers[id]
+		if rec == nil {
+			return fmt.Errorf("%w: 交接编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
+		}
+		if rec.Confirmed {
+			continue
+		}
+		sample, ok := l.Samples[rec.SampleID]
+		switch {
+		case !ok:
+			return fmt.Errorf("%w: 待确认交接 %q 对应的样品 %q 不存在，无法恢复",
+				ErrInvalid, id, rec.SampleID)
+		case sample == nil:
+			return fmt.Errorf("%w: 待确认交接 %q 对应的样品 %q 记录为 null，无法恢复",
+				ErrInvalid, id, rec.SampleID)
+		case sample.PendingID != id:
+			return fmt.Errorf("%w: 待确认交接 %q 的样品 %q 并未记着该交接编号，无法恢复",
+				ErrInvalid, id, rec.SampleID)
+		}
+	}
+	return nil
 }
 
 // persist 把整份状态原子写入文件：先写同目录临时文件，再 rename 覆盖，
