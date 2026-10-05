@@ -71,12 +71,16 @@ func Open(path string) (*Store, error) {
 // 每个样品先核对待确认交接，再核对销毁数量：已销毁样品仍挂着待确认交接
 // 本身就是损坏，沿用原有的交接恢复报错。
 //
-// 对带有销毁信息的样品，逐一核对数量守恒（见 validateDestroyedQuantity）：
-// 当前剩余量必须为 0.000，实际销毁量与自身初始量都大于零，且实际销毁量
-// 加上各直接子样创建时取得的初始量之和恰好等于该样品自身的初始量。这里
-// 只统计直接子样创建时的量：子样后来继续分装、转交或销毁都不改变原样
-// 当时已经分出的量，不能改用子样当前剩余量，孙样也不重复计入；没有分出
-// 子样的样品，实际销毁量就应等于自己的初始量。
+// 对带有销毁信息的样品，先核对直接子样关系是否双向一致，再核对数量守恒
+// （见 validateDestroyedQuantity）：Children 中的编号必须各自只出现一次、
+// 对应现存样品且来源编号恰好指向本样品；反过来，来源编号指向本样品的样品
+// 也必须全部列在 Children 中。重复列入、来源不符或漏列都按无效数据拒绝，
+// 绝不靠删重复项、忽略漏列项或改写来源接受。关系一致时还须满足：当前剩余
+// 量必须为 0.000，实际销毁量与自身初始量都大于零，且实际销毁量加上各
+// 直接子样创建时取得的初始量之和恰好等于该样品自身的初始量。这里只统计
+// 直接子样创建时的量：子样后来继续分装、转交或销毁都不改变原样当时已经
+// 分出的量，不能改用子样当前剩余量，孙样也不重复计入；没有分出子样的
+// 样品，实际销毁量就应等于自己的初始量。
 //
 // 样品的非空 PendingID 必须指向一条实际存在、尚未确认、且属于该样品的
 // 交接；每条尚未确认的交接也必须对应一份实际存在、且 PendingID 正好指向
@@ -171,17 +175,23 @@ func validateRestored(l *ledger) error {
 // 销毁处理的是样品当时的全部剩余量，因此恢复时必须满足：
 //   - 当前剩余量为 0.000；
 //   - 自身初始量与实际销毁量都大于零（参与核对的数量必须为正）；
+//   - 计入核对的直接子样关系必须双向一致：Children 中每个编号都对应一份
+//     现存样品、该子样的来源编号恰好指向本样品，且每个编号只出现一次；
+//     反过来，数据中凡是来源编号指向本样品的样品，也必须全部列在其中。
+//     重复列入、来源编号不符或漏列都属于来源关系矛盾，即使数量等式碰巧
+//     成立也按无效数据拒绝，绝不靠删重复项、忽略漏列项或改写来源接受；
 //   - 实际销毁量加上它直接分出的各子样创建时取得的初始量之和，恰好等于
 //     该样品自身的初始量。
 //
-// 直接子样总量取各子样记录自身的 Initial（创建时取得的量），只统计
-// Children 中的直接子样：子样后来继续分装、转交或销毁都不改变原样当时
-// 已经分出的量，不能改用子样当前剩余量，孙样也不重复计入。没有分出
-// 子样时，直接子样总量为 0，实际销毁量就应等于自身初始量。同一份数据
-// 里的其他原样不参与本次核对。合计超过 int64 可表示范围时按无效数据
-// 拒绝，不能因数量过大把回绕后的差额当作合法结果接受。任一不符都返回
-// 包装了 ErrInvalid 的错误，信息写明样品编号与数量不符的原因；涉及合计
-// 不一致时同时展示初始量、销毁量与直接子样总量，统一按三位小数毫升展示。
+// 直接子样总量取各子样记录自身的 Initial（创建时取得的量），只统计关系
+// 一致的直接子样：子样后来继续分装、转交或销毁都不改变原样当时已经分出
+// 的量，不能改用子样当前剩余量，孙样也不重复计入。没有分出自样时，直接
+// 子样总量为 0，实际销毁量就应等于自身初始量。同一份数据里的其他原样不
+// 参与本次核对。合计超过 int64 可表示范围时按无效数据拒绝，不能因数量
+// 过大把回绕后的差额当作合法结果接受。任一不符都返回包装了 ErrInvalid
+// 的错误，信息写明有问题的样品编号、涉及的子样编号与具体原因（重复列入、
+// 来源不符、漏列或数量不符）；涉及合计不一致时同时展示初始量、销毁量与
+// 直接子样总量，统一按三位小数毫升展示。
 func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) error {
 	const msgTail = "，无法恢复"
 	destroyedQty := rec.Destroyed.Qty
@@ -197,13 +207,30 @@ func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) er
 			ErrInvalid, sampleID, formatUnits(destroyedQty), msgTail)
 	}
 
-	// 只统计直接子样创建时取得的初始量；子样后续变化与孙样都不计入。
+	// 正向核对 Children：只统计关系一致的直接子样创建时取得的初始量。
+	// 同一编号重复列入，或列入来源编号不指向本样品的样品，即使合计碰巧
+	// 等于初始量也是互相矛盾的来源关系，必须拒绝；子样后续变化与孙样都
+	// 不计入。
+	listed := make(map[string]struct{}, len(rec.Children))
 	var directChildrenTotal int64
 	for _, childID := range rec.Children {
+		if _, dup := listed[childID]; dup {
+			return fmt.Errorf("%w: 样品 %q 的销毁数量核对失败：直接子样编号 %q 在子样列表中重复列入，同一子样只能按其创建时取得的初始量计入一次，不能靠重复凑齐数量%s",
+				ErrInvalid, sampleID, childID, msgTail)
+		}
+		listed[childID] = struct{}{}
 		child, ok := l.Samples[childID]
 		if !ok || child == nil {
-			return fmt.Errorf("%w: 样品 %q 的直接子样 %q 不存在，无法核对销毁数量%s",
+			return fmt.Errorf("%w: 样品 %q 的销毁数量核对失败：列出的直接子样 %q 不存在，无法核对销毁数量%s",
 				ErrInvalid, sampleID, childID, msgTail)
+		}
+		if child.ParentID != sampleID {
+			if child.ParentID == "" {
+				return fmt.Errorf("%w: 样品 %q 的销毁数量核对失败：列出的子样 %q 是登记的原样（没有来源编号），并非样品 %q 直接分出的子样，来源不符不能计入%s",
+					ErrInvalid, sampleID, childID, sampleID, msgTail)
+			}
+			return fmt.Errorf("%w: 样品 %q 的销毁数量核对失败：列出的子样 %q 来源编号为 %q，并不指向样品 %q，来源不符，不能把别的样品分出的子样计入本样品%s",
+				ErrInvalid, sampleID, childID, child.ParentID, sampleID, msgTail)
 		}
 		if child.Initial <= 0 {
 			return fmt.Errorf("%w: 样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对销毁数量%s",
@@ -215,6 +242,24 @@ func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) er
 				ErrInvalid, sampleID, formatUnits(destroyedQty), msgTail)
 		}
 		directChildrenTotal = next
+	}
+
+	// 反向核对：凡是来源编号指向本样品的现存样品，都是本样品直接分出的
+	// 子样，必须全部列在 Children 中；漏列同样造成来源关系矛盾（查询出
+	// 的父子关系与销毁核对互相对不上），即使数量等式成立也拒绝。错误
+	// 信息按编号排序，保证同一份损坏数据每次打开的提示一致。
+	missing := make([]string, 0)
+	for otherID, other := range l.Samples {
+		if other != nil && other.ParentID == sampleID {
+			if _, ok := listed[otherID]; !ok {
+				missing = append(missing, otherID)
+			}
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("%w: 样品 %q 的销毁数量核对失败：子样 %s 的来源编号指向样品 %q，却没有列在样品 %q 的直接子样列表中（漏列），直接子样必须全部列入，不能忽略漏列项凑齐数量%s",
+			ErrInvalid, sampleID, strings.Join(missing, "、"), sampleID, sampleID, msgTail)
 	}
 
 	total := destroyedQty + directChildrenTotal
