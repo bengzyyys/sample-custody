@@ -3,6 +3,7 @@ package custody
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -228,10 +229,12 @@ func (s *Store) Split(in SplitInput) (*Sample, error) {
 		}
 		seen[id] = struct{}{}
 		parsed = append(parsed, parsedPart{id: id, qty: qty})
-		total += qty
-		if total < 0 {
+		// 先查溢出再累加：qty 与 total 均非负，直接相加会在 int64 溢出时
+		// 回绕，可能把超范围的合计误判为一个更小的合法数量。
+		if qty > math.MaxInt64-total {
 			return nil, fmt.Errorf("%w: 子样总量超出可表示范围", ErrInvalid)
 		}
+		total += qty
 	}
 
 	if parent.Destroyed != nil {
