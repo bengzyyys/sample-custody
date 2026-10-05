@@ -73,6 +73,14 @@ func Open(path string) (*Store, error) {
 // 内容还必须与样品当前记录一致：样品未销毁、剩余量大于零、交出人等于
 // 当前持有人、交出地点等于当前地点、交接量精确等于当前剩余量。
 //
+// 对带有销毁信息的样品，恢复时还要核对销毁数量守恒：当前剩余量必须为
+// 0.000，且实际销毁量加上各直接子样创建时取得的初始量之和，必须恰好
+// 等于该样品自身的初始量（参与核对的初始量与实际销毁量都必须大于零）。
+// 子样后来继续分装、转交或销毁都不改变当时已分出的量，因此只统计直接
+// 子样的初始量，不看子样当前剩余量，也不把更下一代计入；没有子样的样品
+// 实际销毁量就应等于自身初始量。没有销毁信息的旧样品不做这项核对，即使
+// 剩余量为零也不能据此补出销毁记录。
+//
 // 已确认交接属于保留的历史，不要求样品继续指向它，也不核对其与样品当前
 // 持有人、地点或剩余量的差异（样品后来分装、移动或销毁都不能否定当时的
 // 接收事实）；但它必须保留有效的接收信息：确认人非空且与该交接原先指定
@@ -91,26 +99,30 @@ func validateRestored(l *ledger) error {
 		if rec == nil {
 			return fmt.Errorf("%w: 样品编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
 		}
-		if rec.PendingID == "" {
-			continue
+		if rec.PendingID != "" {
+			tr, ok := l.Transfers[rec.PendingID]
+			switch {
+			case !ok:
+				return fmt.Errorf("%w: 样品 %q 记着待确认交接 %q，但该交接不存在，无法恢复",
+					ErrInvalid, id, rec.PendingID)
+			case tr == nil:
+				return fmt.Errorf("%w: 样品 %q 记着待确认交接 %q，但该交接记录为 null，无法恢复",
+					ErrInvalid, id, rec.PendingID)
+			case tr.Confirmed:
+				return fmt.Errorf("%w: 样品 %q 记着的交接 %q 已确认，不能仍是待确认，无法恢复",
+					ErrInvalid, id, rec.PendingID)
+			case tr.SampleID != id:
+				return fmt.Errorf("%w: 样品 %q 记着的待确认交接 %q 属于样品 %q，无法恢复",
+					ErrInvalid, id, rec.PendingID, tr.SampleID)
+			}
+			if err := validatePendingContent(id, rec, tr); err != nil {
+				return err
+			}
 		}
-		tr, ok := l.Transfers[rec.PendingID]
-		switch {
-		case !ok:
-			return fmt.Errorf("%w: 样品 %q 记着待确认交接 %q，但该交接不存在，无法恢复",
-				ErrInvalid, id, rec.PendingID)
-		case tr == nil:
-			return fmt.Errorf("%w: 样品 %q 记着待确认交接 %q，但该交接记录为 null，无法恢复",
-				ErrInvalid, id, rec.PendingID)
-		case tr.Confirmed:
-			return fmt.Errorf("%w: 样品 %q 记着的交接 %q 已确认，不能仍是待确认，无法恢复",
-				ErrInvalid, id, rec.PendingID)
-		case tr.SampleID != id:
-			return fmt.Errorf("%w: 样品 %q 记着的待确认交接 %q 属于样品 %q，无法恢复",
-				ErrInvalid, id, rec.PendingID, tr.SampleID)
-		}
-		if err := validatePendingContent(id, rec, tr); err != nil {
-			return err
+		if rec.Destroyed != nil {
+			if err := validateRestoredDestruction(l, id, rec); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -173,6 +185,59 @@ func validatePendingContent(sampleID string, sample *sampleRecord, tr *transferR
 	case tr.Qty != sample.Remaining:
 		return fmt.Errorf("%w: 样品 %q 的待确认交接 %q 的交接量 %s 毫升与样品当前剩余量 %s 毫升不一致，无法恢复",
 			ErrInvalid, sampleID, tr.ID, formatUnits(tr.Qty), formatUnits(sample.Remaining))
+	}
+	return nil
+}
+
+// validateRestoredDestruction 核对一条销毁记录的数量守恒。样品已销毁时
+// 当前剩余量必须为 0.000，且实际销毁量加上各直接子样创建时取得的初始量
+// 之和，必须恰好等于该样品自身的初始量；参与核对的初始量与实际销毁量都
+// 必须大于零。这里统计的是各直接子样创建时取得的量：子样后来继续分装、
+// 转交或销毁都不改变原样当时已经分出的量，因此不取子样当前剩余量，也不
+// 把更下一代计入；同一份数据里的其他原样不参与这次核对。合计超出可表示
+// 范围同样按无效数据拒绝，不能因数量过大把差额忽略。任一不符都返回包装
+// 了 ErrInvalid 的错误，信息写明样品编号与不符原因；合计不一致时同时
+// 列出初始量、实际销毁量与直接子样总量，统一按三位小数毫升展示。
+func validateRestoredDestruction(l *ledger, id string, rec *sampleRecord) error {
+	d := rec.Destroyed
+	if rec.Remaining != 0 {
+		return fmt.Errorf("%w: 样品 %q 已销毁，但当前剩余量为 %s 毫升（应为 0.000），无法恢复",
+			ErrInvalid, id, formatUnits(rec.Remaining))
+	}
+	if rec.Initial <= 0 {
+		return fmt.Errorf("%w: 样品 %q 已销毁，但初始量 %s 毫升不是大于零的有效数量，无法恢复",
+			ErrInvalid, id, formatUnits(rec.Initial))
+	}
+	if d.Qty <= 0 {
+		return fmt.Errorf("%w: 样品 %q 的实际销毁量 %s 毫升不是大于零的有效数量，无法恢复",
+			ErrInvalid, id, formatUnits(d.Qty))
+	}
+	var childTotal int64
+	for _, childID := range rec.Children {
+		child, ok := l.Samples[childID]
+		switch {
+		case !ok:
+			return fmt.Errorf("%w: 样品 %q 已销毁，但其直接子样 %q 不存在，无法核对销毁数量，无法恢复",
+				ErrInvalid, id, childID)
+		case child == nil:
+			return fmt.Errorf("%w: 样品 %q 已销毁，但其直接子样 %q 的记录为 null，无法核对销毁数量，无法恢复",
+				ErrInvalid, id, childID)
+		}
+		var sumOK bool
+		childTotal, sumOK = addUnits(childTotal, child.Initial)
+		if !sumOK {
+			return fmt.Errorf("%w: 样品 %q 的直接子样初始量合计超出可表示范围，无法恢复",
+				ErrInvalid, id)
+		}
+	}
+	total, ok := addUnits(d.Qty, childTotal)
+	if !ok {
+		return fmt.Errorf("%w: 样品 %q 的实际销毁量与直接子样初始量合计超出可表示范围，无法恢复",
+			ErrInvalid, id)
+	}
+	if total != rec.Initial {
+		return fmt.Errorf("%w: 样品 %q 的销毁数量不符：初始量 %s 毫升，实际销毁量 %s 毫升，直接子样初始量合计 %s 毫升，无法恢复",
+			ErrInvalid, id, formatUnits(rec.Initial), formatUnits(d.Qty), formatUnits(childTotal))
 	}
 	return nil
 }

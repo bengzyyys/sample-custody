@@ -52,6 +52,16 @@ func parseQuantity(raw string) (int64, error) {
 	return units, nil
 }
 
+// addUnits 返回 a+b；结果超出 int64 可表示范围时 ok 为 false，
+// 调用方据此把过大的合计按无效数据拒绝，而不是让溢出悄悄回绕。
+func addUnits(a, b int64) (sum int64, ok bool) {
+	sum = a + b
+	if (b > 0 && sum < a) || (b < 0 && sum > a) {
+		return 0, false
+	}
+	return sum, true
+}
+
 // formatUnits 把内部整数数量统一渲染为三位小数的毫升字符串。
 func formatUnits(units int64) string {
 	if units < 0 {
