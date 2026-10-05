@@ -69,10 +69,13 @@ func Open(path string) (*Store, error) {
 // validateRestored 校验从文件恢复的数据中待确认交接关联是否一致。
 // 样品的非空 pendingId 必须指向一条实际存在、尚未确认、且属于该样品的
 // 交接；每条尚未确认的交接也必须对应一份实际存在、且 pendingId 正好指向
-// 它的样品。已确认交接属于保留的历史，不要求样品继续指向它，也不核对
-// 其与样品当前持有人、地点或剩余量的差异。集合中占用编号却为 null 的
-// 条目视为损坏，不能当作记录不存在。任一问题都使整个文件无法恢复，
-// 绝不只加载其中一部分，也不改动原文件。
+// 它的样品。待确认交接表示该样品当前全部剩余量尚待指定人员接收，因此
+// 还必须与样品当前记录一致：交出人等于当前持有人、交出地点等于当前地点、
+// 交接量精确等于当前剩余量，且样品未销毁、剩余量大于零。已确认交接属于
+// 保留的历史，不要求样品继续指向它，也不核对其与样品当前持有人、地点或
+// 剩余量的差异。集合中占用编号却为 null 的条目视为损坏，不能当作记录不
+// 存在。任一问题都使整个文件无法恢复，绝不只加载其中一部分，也不改动
+// 原文件。
 func validateRestored(l *ledger) error {
 	sampleIDs := make([]string, 0, len(l.Samples))
 	for id := range l.Samples {
@@ -102,6 +105,9 @@ func validateRestored(l *ledger) error {
 			return fmt.Errorf("%w: 样品 %q 记着的待确认交接 %q 属于样品 %q，无法恢复",
 				ErrInvalid, id, rec.PendingID, tr.SampleID)
 		}
+		if err := validatePendingConsistency(id, rec, tr); err != nil {
+			return err
+		}
 	}
 
 	transferIDs := make([]string, 0, len(l.Transfers))
@@ -129,6 +135,36 @@ func validateRestored(l *ledger) error {
 			return fmt.Errorf("%w: 待确认交接 %q 的样品 %q 并未记着该交接编号，无法恢复",
 				ErrInvalid, id, rec.SampleID)
 		}
+	}
+	return nil
+}
+
+// validatePendingConsistency 核对一条双向关联成立的待确认交接是否与样品
+// 当前记录矛盾。待确认交接转移的是该样品当前全部剩余量，所以交出人、
+// 交出地点、交接量必须分别与样品的当前持有人、当前地点、当前剩余量
+// 完全一致；样品还必须未销毁且仍有剩余量。任一条件不成立都返回包装了
+// ErrInvalid 的错误，指明样品编号、交接编号与冲突项；数量冲突会同时
+// 给出交接记录与样品当前的毫升数（三位小数）。
+func validatePendingConsistency(sampleID string, sample *sampleRecord, tr *transferRecord) error {
+	if sample.Destroyed != nil {
+		return fmt.Errorf("%w: 样品 %q 的待确认交接 %q 仍未确认，但样品已销毁，无法恢复",
+			ErrInvalid, sampleID, tr.ID)
+	}
+	if sample.Remaining <= 0 {
+		return fmt.Errorf("%w: 样品 %q 的待确认交接 %q 仍未确认，但样品当前剩余量为 %s 毫升，无法恢复",
+			ErrInvalid, sampleID, tr.ID, formatUnits(sample.Remaining))
+	}
+	if tr.FromHolder != sample.Holder {
+		return fmt.Errorf("%w: 待确认交接 %q 的交出人 %q 与样品 %q 当前持有人 %q 不一致，无法恢复",
+			ErrInvalid, tr.ID, tr.FromHolder, sampleID, sample.Holder)
+	}
+	if tr.FromLocation != sample.Location {
+		return fmt.Errorf("%w: 待确认交接 %q 的交出地点 %q 与样品 %q 当前地点 %q 不一致，无法恢复",
+			ErrInvalid, tr.ID, tr.FromLocation, sampleID, sample.Location)
+	}
+	if tr.Qty != sample.Remaining {
+		return fmt.Errorf("%w: 待确认交接 %q 记录的交接量 %s 毫升与样品 %q 当前剩余量 %s 毫升不一致，无法恢复",
+			ErrInvalid, tr.ID, formatUnits(tr.Qty), sampleID, formatUnits(sample.Remaining))
 	}
 	return nil
 }

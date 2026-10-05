@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -205,6 +206,124 @@ func TestOpenAllowsConfirmedTransferHistory(t *testing.T) {
 	}
 	if !old.Confirmed {
 		t.Fatalf("旧交接应保持已确认: %+v", old)
+	}
+}
+
+// 一条双向关联成立、且与样品当前记录一致的待确认交接 JSON 片段：
+// 样品剩余 6.750、持有人张三、地点 A，交接记录完全吻合。
+const pendingSample6750 = `"S1": {"id":"S1","initial":10000,"remaining":6750,"holder":"张三","location":"A","children":["C1"],"history":[],"pendingId":"T1"}`
+
+func pendingTransfer(qty int64, fromHolder, fromLocation, extra string) string {
+	base := `"T1": {"id":"T1","sampleId":"S1","fromHolder":"` + fromHolder +
+		`","fromLocation":"` + fromLocation +
+		`","toHolder":"李四","toLocation":"B","qty":` +
+		strconv.FormatInt(qty, 10) +
+		`,"handedOverAt":"2026-10-02T09:00:00Z","confirmed":false` + extra + `}`
+	return base
+}
+
+// TestOpenRejectsPendingQuantityMismatch 对应题面示例：样品原 10.000 毫升，
+// 已分出 3.250 毫升，当前待确认交接若仍写 10.000 毫升，必须拒绝打开，
+// 错误同时给出交接量与样品当前剩余量（三位小数毫升）。
+func TestOpenRejectsPendingQuantityMismatch(t *testing.T) {
+	path := writeRawLedger(t, `{
+		"version": 1,
+		"samples": {`+pendingSample6750+`},
+		"transfers": {`+pendingTransfer(10000, "张三", "A", "")+`}
+	}`)
+	mustRejectOpen(t, path, "S1", "T1", "10.000", "6.750")
+}
+
+func TestOpenRejectsPendingHolderMismatch(t *testing.T) {
+	path := writeRawLedger(t, `{
+		"version": 1,
+		"samples": {`+pendingSample6750+`},
+		"transfers": {`+pendingTransfer(6750, "王五", "A", "")+`}
+	}`)
+	mustRejectOpen(t, path, "S1", "T1", "王五", "张三")
+}
+
+func TestOpenRejectsPendingLocationMismatch(t *testing.T) {
+	path := writeRawLedger(t, `{
+		"version": 1,
+		"samples": {`+pendingSample6750+`},
+		"transfers": {`+pendingTransfer(6750, "张三", "C", "")+`}
+	}`)
+	mustRejectOpen(t, path, "S1", "T1", "C", "A")
+}
+
+func TestOpenRejectsPendingTransferForDestroyedSample(t *testing.T) {
+	path := writeRawLedger(t, `{
+		"version": 1,
+		"samples": {"S1": {"id":"S1","initial":10000,"remaining":0,"holder":"张三","location":"A","children":[],"history":[],"pendingId":"T1","destroyed":{"operator":"张三","location":"A","at":"2026-10-03T09:00:00Z","reason":"废弃","qty":6750}}},
+		"transfers": {`+pendingTransfer(6750, "张三", "A", "")+`}
+	}`)
+	mustRejectOpen(t, path, "S1", "T1", "销毁")
+}
+
+func TestOpenRejectsPendingTransferForZeroRemainingSample(t *testing.T) {
+	// 未销毁但剩余量为零（例如被篡改过）的样品也不能挂着待确认交接。
+	path := writeRawLedger(t, `{
+		"version": 1,
+		"samples": {"S1": {"id":"S1","initial":10000,"remaining":0,"holder":"张三","location":"A","children":[],"history":[],"pendingId":"T1"}},
+		"transfers": {`+pendingTransfer(0, "张三", "A", "")+`}
+	}`)
+	mustRejectOpen(t, path, "S1", "T1", "0.000")
+}
+
+func TestOpenAllowsConsistentPendingAfterSplit(t *testing.T) {
+	// 题面示例的合法分支：10.000 毫升分出 3.250 毫升后，以剩余 6.750
+	// 毫升发起的待确认交接，交出人/地点与当前记录一致时应正常恢复，
+	// 保持待确认状态，并仍可由指定接收人在目的地点确认。
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, "S1", "10.000", "张三", "实验室A")
+	if _, err := s.Split(SplitInput{ParentID: "S1", Parts: []SplitPart{{ID: "C1", Qty: "3.250"}}}); err != nil {
+		t.Fatal(err)
+	}
+	handedAt := time.Date(2026, 10, 2, 10, 0, 0, 0, time.UTC)
+	if _, err := s.Handover(HandoverInput{
+		TransferID: "T1", SampleID: "S1",
+		FromHolder: "张三", FromLocation: "实验室A",
+		ToHolder: "李四", ToLocation: "实验室B", HandedOverAt: handedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("待确认交接与样品当前记录一致时应能打开: %v", err)
+	}
+	view, err := s2.GetSample("S1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Remaining != "6.750" || view.Holder != "张三" || view.Location != "实验室A" {
+		t.Fatalf("恢复后样品当前记录不应被改动: %+v", view)
+	}
+	if view.PendingTransfer == nil || view.PendingTransfer.TransferID != "T1" || view.PendingTransfer.Confirmed {
+		t.Fatalf("交接应保持待确认状态: %+v", view.PendingTransfer)
+	}
+	if view.PendingTransfer.Qty != "6.750" {
+		t.Fatalf("待确认交接量应为 6.750, got %s", view.PendingTransfer.Qty)
+	}
+	received, err := s2.Confirm(ConfirmInput{"T1", "李四", "实验室B", handedAt.Add(time.Hour)})
+	if err != nil {
+		t.Fatalf("恢复后应仍能按原规则由指定接收人确认: %v", err)
+	}
+	if !received.Confirmed {
+		t.Fatalf("确认后交接应结束待确认状态: %+v", received)
+	}
+	after, err := s2.GetSample("S1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Holder != "李四" || after.Location != "实验室B" || after.PendingTransfer != nil {
+		t.Fatalf("确认后持有人和地点应更新且待确认结束: %+v", after)
 	}
 }
 
