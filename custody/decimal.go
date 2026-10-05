@@ -53,11 +53,20 @@ func parseQuantity(raw string) (int64, error) {
 }
 
 // formatUnits 把内部整数数量统一渲染为三位小数的毫升字符串。
+// 负值只用于说明损坏数据中的非法数量，必须对包括 math.MinInt64 在内的
+// 任意 int64 都能正常渲染：不能对整个值取负（MinInt64 取负会回绕成自身，
+// 导致无限递归），改为按向零截断的整数部分和小数部分分别渲染，只对绝对
+// 值不超过 999 的小数余数取负。
 func formatUnits(units int64) string {
+	whole := units / mlScale
+	frac := units % mlScale
 	if units < 0 {
-		return "-" + formatUnits(-units)
+		frac = -frac
+		if whole == 0 {
+			return fmt.Sprintf("-0.%03d", frac)
+		}
 	}
-	return fmt.Sprintf("%d.%03d", units/mlScale, units%mlScale)
+	return fmt.Sprintf("%d.%03d", whole, frac)
 }
 
 // trimRequired 去掉首尾空白，并要求结果非空。

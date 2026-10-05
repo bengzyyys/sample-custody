@@ -66,10 +66,18 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// validateRestored 校验从文件恢复的数据中销毁数量与交接关联是否一致。
+// validateRestored 校验从文件恢复的数据中每份样品自身的数量、待确认交接
+// 与销毁数量是否一致。
 //
-// 每个样品先核对待确认交接，再核对销毁数量：已销毁样品仍挂着待确认交接
-// 本身就是损坏，沿用原有的交接恢复报错。
+// 每个样品先核对自身数量与待确认交接，再核对销毁数量：已销毁样品仍挂着
+// 待确认交接本身就是损坏，沿用原有的交接恢复报错。
+//
+// 没有销毁信息的样品仍视为未销毁（不会仅凭 0.000 补出销毁记录），但它的
+// 数量必须自洽：自身初始量必须大于零，剩余量可以为零却不能为负、也不能
+// 超过自身初始量。这一规则同时适用于登记的原样和分装产生的子样；子样的
+// 上限是它自己创建时取得的初始量，不能借用父样或其他样品的量。样品是否
+// 挂着待确认交接不影响这项检查：即使待确认交接量恰好等于错误的剩余量，
+// 数量越界的样品也必须拒绝（见 validateActiveQuantities）。
 //
 // 对带有销毁信息的样品，逐一核对数量守恒（见 validateDestroyedQuantity）：
 // 当前剩余量必须为 0.000，实际销毁量与自身初始量都大于零，且实际销毁量
@@ -104,6 +112,13 @@ func validateRestored(l *ledger) error {
 		rec := l.Samples[id]
 		if rec == nil {
 			return fmt.Errorf("%w: 样品编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
+		}
+		// 先核对样品自身数量是否自洽：数量越界的样品即使挂着交接量恰好
+		// 一致的待确认交接，也不能被交接检查放行，必须按数量规则拒绝。
+		if rec.Destroyed == nil {
+			if err := validateActiveQuantities(id, rec); err != nil {
+				return err
+			}
 		}
 		if rec.PendingID != "" {
 			tr, ok := l.Transfers[rec.PendingID]
@@ -166,6 +181,34 @@ func validateRestored(l *ledger) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// validateActiveQuantities 核对一份没有销毁信息（即未销毁）的样品自身数量
+// 是否合理。重新打开旧数据时，没有销毁信息的样品仍视为未销毁，不会仅凭
+// 剩余量 0.000 补出销毁记录，但它的数量必须自洽：
+//   - 自身初始量必须大于零（原样取登记量，子样取创建时分得的量）；
+//   - 剩余量可以为零（分装用尽的旧约定），但不能为负；
+//   - 剩余量不能超过自身初始量。
+//
+// 这一规则对登记的原样和分装产生的子样同样适用：子样的上限是它自己创建
+// 时取得的初始量，与其父样或其他样品的数量无关，不能借用父样的量。样品
+// 是否挂着待确认交接不影响本检查——即使交接量恰好等于错误的剩余量，数量
+// 越界也必须拒绝。任一不符都返回包装了 ErrInvalid 的错误，信息写明样品
+// 编号、违反的规则与初始量、剩余量，统一按三位小数毫升展示。
+func validateActiveQuantities(sampleID string, rec *sampleRecord) error {
+	const msgTail = "，无法恢复"
+	switch {
+	case rec.Initial <= 0:
+		return fmt.Errorf("%w: 未销毁样品 %q 的初始量 %s 毫升必须大于零%s",
+			ErrInvalid, sampleID, formatUnits(rec.Initial), msgTail)
+	case rec.Remaining < 0:
+		return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升不能为负（初始量 %s 毫升）%s",
+			ErrInvalid, sampleID, formatUnits(rec.Remaining), formatUnits(rec.Initial), msgTail)
+	case rec.Remaining > rec.Initial:
+		return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升超过自身初始量 %s 毫升，剩余量不得大于初始量%s",
+			ErrInvalid, sampleID, formatUnits(rec.Remaining), formatUnits(rec.Initial), msgTail)
 	}
 	return nil
 }
