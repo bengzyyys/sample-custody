@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,14 @@ type Store struct {
 
 // Open 打开 path 指向的本地样品数据：文件不存在时创建一份新数据，
 // 已存在时原样重新打开，历史记录与交接编号判断继续有效。
+//
+// 重新打开时必须能完整恢复待确认交接状态：样品的非空 PendingID 必须
+// 指向一条实际存在、尚未确认且属于该样品的交接，每条尚未确认的交接
+// 也必须对应一份实际存在、且 PendingID 正指向它的样品；样品或交接
+// 集合中占用编号却没有记录（null）的条目同样视为损坏。任一关联无法
+// 恢复时返回空的 Store 和包装了 ErrInvalid 的错误（错误文字指出相关
+// 样品或交接编号及原因），不部分加载记录，也不补造交接、改确认状态
+// 或改写原文件。已确认交接属于保留的历史，不要求样品继续指向它。
 func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("%w: 数据文件路径不能为空", ErrInvalid)
@@ -50,6 +59,11 @@ func Open(path string) (*Store, error) {
 		if l.Transfers == nil {
 			l.Transfers = make(map[string]*transferRecord)
 		}
+		// 待确认交接与样品的关联必须完整可恢复，否则整份数据拒绝打开：
+		// 既不部分加载有效记录，也不替用户补造交接、改确认状态或回写文件。
+		if err := validateLedger(&l); err != nil {
+			return nil, fmt.Errorf("打开本地样品数据 %s 失败: %w", path, err)
+		}
 		s.data = &l
 	case os.IsNotExist(err):
 		s.data = newLedger()
@@ -60,6 +74,78 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("打开本地样品数据 %s 失败: %w", path, err)
 	}
 	return s, nil
+}
+
+// validateLedger 校验重新打开的账本能否完整恢复待确认交接状态。
+// 样品的非空 PendingID 必须指向一条实际存在、尚未确认且属于该样品的
+// 交接；反过来，每条尚未确认的交接都必须对应一份实际存在、且
+// PendingID 正指向它的样品。集合中占用了编号却没有记录（null）的
+// 条目同样视为损坏。任一问题都返回包装了 ErrInvalid 的错误，调用方
+// 必须整份拒绝，不得只加载部分记录。
+func validateLedger(l *ledger) error {
+	sampleIDs := make([]string, 0, len(l.Samples))
+	for id, rec := range l.Samples {
+		if rec == nil {
+			return fmt.Errorf("%w: 样品集合中编号 %q 已被占用但没有记录（值为 null），无法恢复",
+				ErrInvalid, id)
+		}
+		sampleIDs = append(sampleIDs, id)
+	}
+	sort.Strings(sampleIDs)
+
+	transferIDs := make([]string, 0, len(l.Transfers))
+	for id, rec := range l.Transfers {
+		if rec == nil {
+			return fmt.Errorf("%w: 交接集合中编号 %q 已被占用但没有记录（值为 null），无法恢复",
+				ErrInvalid, id)
+		}
+		transferIDs = append(transferIDs, id)
+	}
+	sort.Strings(transferIDs)
+
+	// 样品 -> 待确认交接方向的校验。
+	for _, id := range sampleIDs {
+		sample := l.Samples[id]
+		if sample.PendingID == "" {
+			continue
+		}
+		t, ok := l.Transfers[sample.PendingID]
+		if !ok {
+			return fmt.Errorf("%w: 样品 %q 记有待确认交接 %q，但该交接不存在，无法恢复待确认状态",
+				ErrInvalid, id, sample.PendingID)
+		}
+		if t.Confirmed {
+			return fmt.Errorf("%w: 样品 %q 仍记有待确认交接 %q，但该交接已经确认，无法恢复待确认状态",
+				ErrInvalid, id, sample.PendingID)
+		}
+		if t.SampleID != id {
+			return fmt.Errorf("%w: 样品 %q 的待确认交接 %q 实际属于样品 %q，无法恢复待确认状态",
+				ErrInvalid, id, sample.PendingID, t.SampleID)
+		}
+	}
+
+	// 待确认交接 -> 样品方向的校验。已确认交接是保留的历史，不再要求
+	// 样品继续指向它（样品可能已完成旧交接后又流转、分装或销毁）。
+	for _, id := range transferIDs {
+		t := l.Transfers[id]
+		if t.Confirmed {
+			continue
+		}
+		sample, ok := l.Samples[t.SampleID]
+		if !ok {
+			return fmt.Errorf("%w: 交接 %q 尚未确认，但其样品 %q 不存在，无法恢复待确认状态",
+				ErrInvalid, id, t.SampleID)
+		}
+		if sample.PendingID == "" {
+			return fmt.Errorf("%w: 交接 %q 尚未确认，但样品 %q 已清除对应的待确认交接编号，无法恢复待确认状态",
+				ErrInvalid, id, t.SampleID)
+		}
+		if sample.PendingID != id {
+			return fmt.Errorf("%w: 交接 %q 尚未确认，但样品 %q 的待确认交接编号指向 %q，无法恢复待确认状态",
+				ErrInvalid, id, t.SampleID, sample.PendingID)
+		}
+	}
+	return nil
 }
 
 // persist 把整份状态原子写入文件：先写同目录临时文件，再 rename 覆盖，
