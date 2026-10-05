@@ -66,14 +66,16 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// validateRestored 校验从文件恢复的数据中待确认交接关联是否一致。
+// validateRestored 校验从文件恢复的数据中交接关联与接收事实是否一致。
 // 样品的非空 pendingId 必须指向一条实际存在、尚未确认、且属于该样品的
 // 交接；每条尚未确认的交接也必须对应一份实际存在、且 pendingId 正好指向
 // 它的样品。待确认交接表示样品当前全部剩余量尚待指定人员接收，因此其
 // 内容还必须与样品当前记录一致：样品未销毁、剩余量大于零、交出人等于
 // 当前持有人、交出地点等于当前地点、交接量精确等于当前剩余量。已确认
 // 交接属于保留的历史，不要求样品继续指向它，也不核对其与样品当前
-// 持有人、地点或剩余量的差异。集合中占用编号却为 null 的条目视为
+// 持有人、地点或剩余量的差异；但其接收事实必须完整有效：确认人非空白
+// 且与发起时指定的接收人一致，接收时间存在、非零时间且不早于交出时间
+// （按实际时刻比较，恰好相等合法）。集合中占用编号却为 null 的条目视为
 // 损坏，不能当作记录不存在。任一问题都使整个文件无法恢复，绝不只
 // 加载其中一部分，也不改动原文件。
 func validateRestored(l *ledger) error {
@@ -121,6 +123,9 @@ func validateRestored(l *ledger) error {
 			return fmt.Errorf("%w: 交接编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
 		}
 		if rec.Confirmed {
+			if err := validateConfirmedContent(rec); err != nil {
+				return err
+			}
 			continue
 		}
 		sample, ok := l.Samples[rec.SampleID]
@@ -166,6 +171,35 @@ func validatePendingContent(sampleID string, sample *sampleRecord, tr *transferR
 	case tr.Qty != sample.Remaining:
 		return fmt.Errorf("%w: 样品 %q 的待确认交接 %q 的交接量 %s 毫升与样品当前剩余量 %s 毫升不一致，无法恢复",
 			ErrInvalid, sampleID, tr.ID, formatUnits(tr.Qty), formatUnits(sample.Remaining))
+	}
+	return nil
+}
+
+// validateConfirmedContent 核对一条已确认交接记录的接收事实是否完整有效。
+// 已确认交接必须能说明是谁在什么时间接收了样品：确认人不能缺失、为空或
+// 只有空白，且必须与发起时指定的接收人一致；接收时间必须存在、不是零时间，
+// 且不早于交出时间（按实际时刻比较，恰好相等合法）。任一不符都返回包装了
+// ErrInvalid 的错误，并在信息中写明交接编号、关联样品编号以及具体问题
+// （缺少或无效的接收时间、时间倒置或确认人不符），绝不通过补写确认人、
+// 猜测接收时间或改成待确认来接受异常记录。
+func validateConfirmedContent(tr *transferRecord) error {
+	switch {
+	case strings.TrimSpace(tr.ConfirmedBy) == "":
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）缺少确认人，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID)
+	case tr.ConfirmedBy != tr.ToHolder:
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的确认人 %q 与指定接收人 %q 不符，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID, tr.ConfirmedBy, tr.ToHolder)
+	case tr.ReceivedAt == nil:
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）缺少接收时间，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID)
+	case tr.ReceivedAt.IsZero():
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的接收时间为零时间，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID)
+	case tr.ReceivedAt.Before(tr.HandedOverAt):
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的接收时间 %s 早于交出时间 %s，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID,
+			tr.ReceivedAt.Format(time.RFC3339), tr.HandedOverAt.Format(time.RFC3339))
 	}
 	return nil
 }

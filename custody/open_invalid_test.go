@@ -302,6 +302,88 @@ func TestOpenRejectsPendingHandoverForZeroRemainingSample(t *testing.T) {
 	mustRejectOpen(t, path, "S-001", "TR-002", "0.000")
 }
 
+// rawConfirmedTransfer 是一条合法的已确认交接记录 JSON 片段，
+// 可通过 strings.Replace 注入单项接收事实异常。
+const rawConfirmedTransfer = `"T1": {"id":"T1","sampleId":"S1","fromHolder":"张三","fromLocation":"A","toHolder":"李四","toLocation":"B","qty":1000,"handedOverAt":"2026-10-02T09:00:00Z","confirmed":true,"receivedAt":"2026-10-02T10:00:00Z","confirmedBy":"李四"}`
+
+// writeConfirmedScenario 写入只含一份样品和一条已确认交接的数据文件。
+func writeConfirmedScenario(t *testing.T, transfer string) string {
+	t.Helper()
+	return writeRawLedger(t, `{
+		"version": 1,
+		"samples": {`+rawSampleS1+`},
+		"transfers": {`+transfer+`}
+	}`)
+}
+
+func TestOpenRejectsConfirmedTransferWithoutReceivedAt(t *testing.T) {
+	tr := strings.Replace(rawConfirmedTransfer, `,"receivedAt":"2026-10-02T10:00:00Z"`, ``, 1)
+	mustRejectOpen(t, writeConfirmedScenario(t, tr), "T1", "S1", "接收时间")
+}
+
+func TestOpenRejectsConfirmedTransferWithZeroReceivedAt(t *testing.T) {
+	tr := strings.Replace(rawConfirmedTransfer, `"receivedAt":"2026-10-02T10:00:00Z"`, `"receivedAt":"0001-01-01T00:00:00Z"`, 1)
+	mustRejectOpen(t, writeConfirmedScenario(t, tr), "T1", "S1", "接收时间")
+}
+
+func TestOpenRejectsConfirmedTransferWithReceivedBeforeHandover(t *testing.T) {
+	tr := strings.Replace(rawConfirmedTransfer, `"receivedAt":"2026-10-02T10:00:00Z"`, `"receivedAt":"2026-10-02T08:00:00Z"`, 1)
+	mustRejectOpen(t, writeConfirmedScenario(t, tr), "T1", "S1", "接收时间", "早于", "交出时间")
+}
+
+func TestOpenRejectsConfirmedTransferWithoutConfirmer(t *testing.T) {
+	tr := strings.Replace(rawConfirmedTransfer, `,"confirmedBy":"李四"`, ``, 1)
+	mustRejectOpen(t, writeConfirmedScenario(t, tr), "T1", "S1", "确认人")
+}
+
+func TestOpenRejectsConfirmedTransferWithBlankConfirmer(t *testing.T) {
+	tr := strings.Replace(rawConfirmedTransfer, `"confirmedBy":"李四"`, `"confirmedBy":"  "`, 1)
+	mustRejectOpen(t, writeConfirmedScenario(t, tr), "T1", "S1", "确认人")
+}
+
+func TestOpenRejectsConfirmedTransferWithWrongConfirmer(t *testing.T) {
+	tr := strings.Replace(rawConfirmedTransfer, `"confirmedBy":"李四"`, `"confirmedBy":"王五"`, 1)
+	mustRejectOpen(t, writeConfirmedScenario(t, tr), "T1", "S1", "确认人", "王五", "李四")
+}
+
+func TestOpenRejectsConfirmedTransferPartialLoad(t *testing.T) {
+	// 文件中同时存在完全合法的记录时，也不得只加载其中一部分。
+	tr := strings.Replace(rawConfirmedTransfer, `,"receivedAt":"2026-10-02T10:00:00Z"`, ``, 1)
+	path := writeRawLedger(t, `{
+		"version": 1,
+		"samples": {
+			"OK": {"id":"OK","initial":100,"remaining":100,"holder":"h","location":"l","children":[],"history":[]},
+			`+rawSampleS1+`
+		},
+		"transfers": {`+tr+`}
+	}`)
+	mustRejectOpen(t, path, "T1", "S1")
+}
+
+// TestOpenRestoresConfirmedTransferWithEqualInstants 覆盖接收时间的合法边界：
+// 接收时间恰好等于交出时间可以恢复；时间先后按实际时刻判断，交出时间记为
+// 北京时间十八点、接收时间记为同一天的协调世界时十点，二者是同一时刻。
+// 恢复后按交接编号查询仍显示已确认及原确认人、接收时间与交接量。
+func TestOpenRestoresConfirmedTransferWithEqualInstants(t *testing.T) {
+	tr := `"T1": {"id":"T1","sampleId":"S1","fromHolder":"张三","fromLocation":"A","toHolder":"李四","toLocation":"B","qty":1000,"handedOverAt":"2026-10-02T18:00:00+08:00","confirmed":true,"receivedAt":"2026-10-02T10:00:00Z","confirmedBy":"李四"}`
+	path := writeConfirmedScenario(t, tr)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("接收时间等于交出时间的已确认交接应正常恢复: %v", err)
+	}
+	v, err := s.GetTransfer("T1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.Confirmed || v.ConfirmedBy != "李四" || v.Qty != "1.000" {
+		t.Fatalf("已确认交接应保留原确认人与交接量: %+v", v)
+	}
+	want := time.Date(2026, 10, 2, 10, 0, 0, 0, time.UTC)
+	if v.ReceivedAt == nil || !v.ReceivedAt.Equal(want) {
+		t.Fatalf("接收时间应原样恢复: %+v", v)
+	}
+}
+
 // TestOpenRestoresConsistentPendingHandover 覆盖任务示例的合法分支：
 // 待确认交接正确记录 6.750、当前持有人李四和地点实验室B 时正常恢复，
 // 保持待确认状态，仍由指定接收人王五在目的地点实验室C 确认；旧交接
