@@ -173,6 +173,99 @@ func TestOpenRejectsDestroyedWhenChildMissing(t *testing.T) {
 	mustRejectOpen(t, path, "S-001", "GHOST")
 }
 
+// TestOpenRejectsDestroyedDuplicateChildListing 任务示例：原样 P 初始
+// 10.000，C 由 P 分出 3.000，P 销毁剩余 4.000；子样列表却把 C 写了两遍，
+// 销毁量加两次 C 的合计碰巧等于初始量（4.000+3.000+3.000=10.000）。重复
+// 列入使来源关系自相矛盾，必须拒绝，不能靠删除重复项接受文件。
+func TestOpenRejectsDestroyedDuplicateChildListing(t *testing.T) {
+	l := &ledger{
+		Samples: map[string]*sampleRecord{
+			"P": destroyedSample("P", 10000, 0, 4000, "C", "C"),
+			"C": plainChild("C", "P", 3000, 3000),
+		},
+	}
+	path := writeStructLedger(t, l)
+	mustRejectOpen(t, path, "P", "C", "重复")
+}
+
+// TestOpenRejectsDestroyedChildFromOtherRoot 列入的子样实际来自另一份原样，
+// 即使销毁量 7.000 加该子样初始量 3.000 恰好等于初始量 10.000，来源不符
+// 也必须拒绝，不能靠凑齐数量通过核对。
+func TestOpenRejectsDestroyedChildFromOtherRoot(t *testing.T) {
+	l := &ledger{
+		Samples: map[string]*sampleRecord{
+			"P":  destroyedSample("P", 10000, 0, 7000, "C"),
+			"C":  plainChild("C", "P2", 3000, 3000),
+			"P2": plainChild("P2", "", 8000, 8000),
+		},
+	}
+	path := writeStructLedger(t, l)
+	mustRejectOpen(t, path, "P", "C", "P2", "来源")
+}
+
+// TestOpenRejectsDestroyedChildWithoutParent 列入的编号其实是没有来源的
+// 原样，不能当作本样品的直接子样凑数量。
+func TestOpenRejectsDestroyedChildWithoutParent(t *testing.T) {
+	l := &ledger{
+		Samples: map[string]*sampleRecord{
+			"P": destroyedSample("P", 10000, 0, 7000, "R"),
+			"R": plainChild("R", "", 3000, 3000),
+		},
+	}
+	path := writeStructLedger(t, l)
+	mustRejectOpen(t, path, "P", "R", "来源")
+}
+
+// TestOpenRejectsDestroyedMissingChildListing 反向核对：子样 C 的来源编号
+// 指向 P，P 的子样列表却没有列 C。P 销毁量 10.000、空列表使数量等式
+// 单独成立（10.000=10.000），漏列仍必须拒绝，不能忽略漏列项接受文件。
+func TestOpenRejectsDestroyedMissingChildListing(t *testing.T) {
+	l := &ledger{
+		Samples: map[string]*sampleRecord{
+			"P": destroyedSample("P", 10000, 0, 10000),
+			"C": plainChild("C", "P", 3000, 3000),
+		},
+	}
+	path := writeStructLedger(t, l)
+	mustRejectOpen(t, path, "P", "C", "漏列")
+}
+
+// TestOpenRejectsDestroyedSplitChildMissingGrandchild 关系核对同样适用于
+// 已销毁的分装子样：C 已销毁且孙样 G 的来源指向 C，C 的子样列表漏列 G，
+// 即使 C 的销毁量 3.000 与其自身初始量相等也必须拒绝。
+func TestOpenRejectsDestroyedSplitChildMissingGrandchild(t *testing.T) {
+	l := &ledger{
+		Samples: map[string]*sampleRecord{
+			"P": plainChild("P", "", 7000, 7000),
+			"C": destroyedSampleWithParent("C", "P", 3000, 3000),
+			"G": plainChild("G", "C", 1000, 1000),
+		},
+	}
+	path := writeStructLedger(t, l)
+	mustRejectOpen(t, path, "C", "G", "漏列")
+}
+
+// TestOpenRestoresDestroyedWithSingleDirectChild 任务示例的合法对照：P 初始
+// 10.000、C 由 P 分出 3.000 且只列一次，P 销毁 7.000（7.000+3.000=
+// 10.000），关系一致、数量守恒，正常恢复并保留子样顺序。
+func TestOpenRestoresDestroyedWithSingleDirectChild(t *testing.T) {
+	l := &ledger{
+		Samples: map[string]*sampleRecord{
+			"P": destroyedSample("P", 10000, 0, 7000, "C"),
+			"C": plainChild("C", "P", 3000, 3000),
+		},
+	}
+	s, err := Open(writeStructLedger(t, l))
+	if err != nil {
+		t.Fatalf("C 只列一次且销毁量为 7.000 应符合记录、正常恢复: %v", err)
+	}
+	p, _ := s.GetSample("P")
+	if p.Destruction == nil || p.Destruction.Qty != "7.000" ||
+		len(p.Children) != 1 || p.Children[0] != "C" {
+		t.Fatalf("销毁量与子样列表应原样保留: %+v", p)
+	}
+}
+
 // TestOpenRejectsDestroyedWhenChildInitialNotPositive 直接子样初始量必须
 // 大于零，否则销毁数量核对无意义，拒绝恢复。
 func TestOpenRejectsDestroyedWhenChildInitialNotPositive(t *testing.T) {
