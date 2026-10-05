@@ -226,3 +226,114 @@ func TestOpenAllowsEmptyCollections(t *testing.T) {
 		})
 	}
 }
+
+// divergedScenario 是任务示例的完整文件：原样 S-001 初始 10.000，完成
+// TR-001（已确认，记录当时的 10.000）后分出 3.250 的子样 S-001-A，又以
+// 剩余的 6.750 发起 TR-002（待确认）。占位符可注入单项矛盾：
+//   - __REMAINING__：原样当前剩余量（千分之一毫升）
+//   - __SAMPLE_EXTRA__：原样记录内的额外字段（用于注入销毁信息）
+//   - __PENDING_TR__：TR-002 记录的字段内容
+const divergedScenario = `{
+  "version": 1,
+  "samples": {
+    "S-001": {"id":"S-001","initial":10000,"remaining":__REMAINING__,"holder":"李四","location":"实验室B","children":["S-001-A"],"history":[
+      {"kind":"register","time":"2026-10-02T09:00:00Z","holder":"张三","location":"实验室A","detail":"登记原样"},
+      {"kind":"transfer-out","time":"2026-10-02T10:00:00Z","holder":"张三","location":"实验室A","detail":"发起交接 TR-001，待 李四 在 实验室B 接收"},
+      {"kind":"transfer-in","time":"2026-10-02T11:00:00Z","holder":"李四","location":"实验室B","detail":"交接 TR-001 确认接收（交出时间 2026-10-02T10:00:00Z）"},
+      {"kind":"split","time":"2026-10-02T12:00:00Z","holder":"李四","location":"实验室B","detail":"分装创建子样 S-001-A"},
+      {"kind":"transfer-out","time":"2026-10-03T09:00:00Z","holder":"李四","location":"实验室B","detail":"发起交接 TR-002，待 王五 在 实验室C 接收"}
+    ],"pendingId":"TR-002"__SAMPLE_EXTRA__},
+    "S-001-A": {"id":"S-001-A","parentId":"S-001","initial":3250,"remaining":3250,"holder":"李四","location":"实验室B","children":[],"history":[
+      {"kind":"split","time":"2026-10-02T12:00:00Z","holder":"李四","location":"实验室B","detail":"由样品 S-001 分装"}
+    ]}
+  },
+  "transfers": {
+    "TR-001": {"id":"TR-001","sampleId":"S-001","fromHolder":"张三","fromLocation":"实验室A","toHolder":"李四","toLocation":"实验室B","qty":10000,"handedOverAt":"2026-10-02T10:00:00Z","confirmed":true,"receivedAt":"2026-10-02T11:00:00Z","confirmedBy":"李四"},
+    "TR-002": {__PENDING_TR__}
+  }
+}`
+
+const consistentPendingTR = `"id":"TR-002","sampleId":"S-001","fromHolder":"李四","fromLocation":"实验室B","toHolder":"王五","toLocation":"实验室C","qty":6750,"handedOverAt":"2026-10-03T09:00:00Z","confirmed":false`
+
+// writeDivergedScenario 写入可替换占位符的示例文件。
+func writeDivergedScenario(t *testing.T, remaining, sampleExtra, pendingTR string) string {
+	t.Helper()
+	if remaining == "" {
+		remaining = "6750"
+	}
+	if pendingTR == "" {
+		pendingTR = consistentPendingTR
+	}
+	content := strings.NewReplacer(
+		"__REMAINING__", remaining,
+		"__SAMPLE_EXTRA__", sampleExtra,
+		"__PENDING_TR__", pendingTR,
+	).Replace(divergedScenario)
+	return writeRawLedger(t, content)
+}
+
+func TestOpenRejectsPendingHandoverWithStaleQuantity(t *testing.T) {
+	// 待确认交接仍写着分出子样前的 10.000，而样品当前只剩 6.750。
+	stale := strings.Replace(consistentPendingTR, `"qty":6750`, `"qty":10000`, 1)
+	path := writeDivergedScenario(t, "6750", "", stale)
+	mustRejectOpen(t, path, "S-001", "TR-002", "交接量", "10.000", "6.750")
+}
+
+func TestOpenRejectsPendingHandoverWithWrongHolder(t *testing.T) {
+	wrong := strings.Replace(consistentPendingTR, `"fromHolder":"李四"`, `"fromHolder":"张三"`, 1)
+	path := writeDivergedScenario(t, "", "", wrong)
+	mustRejectOpen(t, path, "S-001", "TR-002", "交出人", "持有人", "张三", "李四")
+}
+
+func TestOpenRejectsPendingHandoverWithWrongLocation(t *testing.T) {
+	wrong := strings.Replace(consistentPendingTR, `"fromLocation":"实验室B"`, `"fromLocation":"实验室A"`, 1)
+	path := writeDivergedScenario(t, "", "", wrong)
+	mustRejectOpen(t, path, "S-001", "TR-002", "交出地点", "当前地点", "实验室A", "实验室B")
+}
+
+func TestOpenRejectsPendingHandoverForDestroyedSample(t *testing.T) {
+	extra := `,"destroyed":{"operator":"李四","location":"实验室B","at":"2026-10-03T08:00:00Z","reason":"实验结束按规程销毁","qty":6750}`
+	path := writeDivergedScenario(t, "", extra, "")
+	mustRejectOpen(t, path, "S-001", "TR-002", "销毁")
+}
+
+func TestOpenRejectsPendingHandoverForZeroRemainingSample(t *testing.T) {
+	path := writeDivergedScenario(t, "0", "", "")
+	mustRejectOpen(t, path, "S-001", "TR-002", "0.000")
+}
+
+// TestOpenRestoresConsistentPendingHandover 覆盖任务示例的合法分支：
+// 待确认交接正确记录 6.750、当前持有人李四和地点实验室B 时正常恢复，
+// 保持待确认状态，仍由指定接收人王五在目的地点实验室C 确认；旧交接
+// TR-001 当时的 10.000 记录继续保留且可查询，不被拒绝或改写。
+func TestOpenRestoresConsistentPendingHandover(t *testing.T) {
+	s, hAt1, rAt1, hAt2, rAt2 := setupDivergedHandover(t)
+
+	s2, err := Open(s.path)
+	if err != nil {
+		t.Fatalf("内容一致的待确认交接应随文件正常恢复: %v", err)
+	}
+	p, err := s2.GetSample("S-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireParentMidSecondHandover(t, p, hAt2)
+
+	old, err := s2.GetTransfer("TR-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireOldFirstTransfer(t, old, hAt1, rAt1)
+
+	done, err := s2.Confirm(ConfirmInput{"TR-002", "王五", "实验室C", rAt2})
+	if err != nil {
+		t.Fatalf("恢复后的待确认交接应仍能由指定接收人在目的地点确认: %v", err)
+	}
+	if !done.Confirmed || done.Qty != "6.750" || done.ConfirmedBy != "王五" {
+		t.Fatalf("确认结果错误: %+v", done)
+	}
+	p, _ = s2.GetSample("S-001")
+	if p.Holder != "王五" || p.Location != "实验室C" || p.PendingTransfer != nil {
+		t.Fatalf("确认后持有人和地点才改变，待确认状态结束: %+v", p)
+	}
+}
