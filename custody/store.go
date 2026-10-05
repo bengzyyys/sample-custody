@@ -66,9 +66,20 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// validateRestored 校验从文件恢复的数据中交接关联是否一致。
-// 样品的非空 pendingId 必须指向一条实际存在、尚未确认、且属于该样品的
-// 交接；每条尚未确认的交接也必须对应一份实际存在、且 pendingId 正好指向
+// validateRestored 校验从文件恢复的数据中销毁数量与交接关联是否一致。
+//
+// 每个样品先核对待确认交接，再核对销毁数量：已销毁样品仍挂着待确认交接
+// 本身就是损坏，沿用原有的交接恢复报错。
+//
+// 对带有销毁信息的样品，逐一核对数量守恒（见 validateDestroyedQuantity）：
+// 当前剩余量必须为 0.000，实际销毁量与自身初始量都大于零，且实际销毁量
+// 加上各直接子样创建时取得的初始量之和恰好等于该样品自身的初始量。这里
+// 只统计直接子样创建时的量：子样后来继续分装、转交或销毁都不改变原样
+// 当时已经分出的量，不能改用子样当前剩余量，孙样也不重复计入；没有分出
+// 子样的样品，实际销毁量就应等于自己的初始量。
+//
+// 样品的非空 PendingID 必须指向一条实际存在、尚未确认、且属于该样品的
+// 交接；每条尚未确认的交接也必须对应一份实际存在、且 PendingID 正好指向
 // 它的样品。待确认交接表示样品当前全部剩余量尚待指定人员接收，因此其
 // 内容还必须与样品当前记录一致：样品未销毁、剩余量大于零、交出人等于
 // 当前持有人、交出地点等于当前地点、交接量精确等于当前剩余量。
@@ -91,26 +102,32 @@ func validateRestored(l *ledger) error {
 		if rec == nil {
 			return fmt.Errorf("%w: 样品编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
 		}
-		if rec.PendingID == "" {
-			continue
+		if rec.PendingID != "" {
+			tr, ok := l.Transfers[rec.PendingID]
+			switch {
+			case !ok:
+				return fmt.Errorf("%w: 样品 %q 记着待确认交接 %q，但该交接不存在，无法恢复",
+					ErrInvalid, id, rec.PendingID)
+			case tr == nil:
+				return fmt.Errorf("%w: 样品 %q 记着待确认交接 %q，但该交接记录为 null，无法恢复",
+					ErrInvalid, id, rec.PendingID)
+			case tr.Confirmed:
+				return fmt.Errorf("%w: 样品 %q 记着的交接 %q 已确认，不能仍是待确认，无法恢复",
+					ErrInvalid, id, rec.PendingID)
+			case tr.SampleID != id:
+				return fmt.Errorf("%w: 样品 %q 记着的待确认交接 %q 属于样品 %q，无法恢复",
+					ErrInvalid, id, rec.PendingID, tr.SampleID)
+			}
+			if err := validatePendingContent(id, rec, tr); err != nil {
+				return err
+			}
 		}
-		tr, ok := l.Transfers[rec.PendingID]
-		switch {
-		case !ok:
-			return fmt.Errorf("%w: 样品 %q 记着待确认交接 %q，但该交接不存在，无法恢复",
-				ErrInvalid, id, rec.PendingID)
-		case tr == nil:
-			return fmt.Errorf("%w: 样品 %q 记着待确认交接 %q，但该交接记录为 null，无法恢复",
-				ErrInvalid, id, rec.PendingID)
-		case tr.Confirmed:
-			return fmt.Errorf("%w: 样品 %q 记着的交接 %q 已确认，不能仍是待确认，无法恢复",
-				ErrInvalid, id, rec.PendingID)
-		case tr.SampleID != id:
-			return fmt.Errorf("%w: 样品 %q 记着的待确认交接 %q 属于样品 %q，无法恢复",
-				ErrInvalid, id, rec.PendingID, tr.SampleID)
-		}
-		if err := validatePendingContent(id, rec, tr); err != nil {
-			return err
+		// 销毁数量核对放在待确认交接核对之后：已销毁样品仍挂着待确认交接
+		// 本身就是损坏，沿用原有的交接恢复报错，保持与既有交接检查的兼容。
+		if rec.Destroyed != nil {
+			if err := validateDestroyedQuantity(id, rec, l); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -146,6 +163,71 @@ func validateRestored(l *ledger) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// validateDestroyedQuantity 核对一份带销毁信息的样品记录其数量是否守恒。
+// 销毁处理的是样品当时的全部剩余量，因此恢复时必须满足：
+//   - 当前剩余量为 0.000；
+//   - 自身初始量与实际销毁量都大于零（参与核对的数量必须为正）；
+//   - 实际销毁量加上它直接分出的各子样创建时取得的初始量之和，恰好等于
+//     该样品自身的初始量。
+//
+// 直接子样总量取各子样记录自身的 Initial（创建时取得的量），只统计
+// Children 中的直接子样：子样后来继续分装、转交或销毁都不改变原样当时
+// 已经分出的量，不能改用子样当前剩余量，孙样也不重复计入。没有分出
+// 子样时，直接子样总量为 0，实际销毁量就应等于自身初始量。同一份数据
+// 里的其他原样不参与本次核对。合计超过 int64 可表示范围时按无效数据
+// 拒绝，不能因数量过大把回绕后的差额当作合法结果接受。任一不符都返回
+// 包装了 ErrInvalid 的错误，信息写明样品编号与数量不符的原因；涉及合计
+// 不一致时同时展示初始量、销毁量与直接子样总量，统一按三位小数毫升展示。
+func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) error {
+	const msgTail = "，无法恢复"
+	destroyedQty := rec.Destroyed.Qty
+	switch {
+	case rec.Remaining != 0:
+		return fmt.Errorf("%w: 样品 %q 已销毁但当前剩余量为 %s 毫升，已销毁样品剩余量必须为 0.000 毫升%s",
+			ErrInvalid, sampleID, formatUnits(rec.Remaining), msgTail)
+	case rec.Initial <= 0:
+		return fmt.Errorf("%w: 样品 %q 的销毁记录无法核对：样品初始量 %s 毫升必须大于零%s",
+			ErrInvalid, sampleID, formatUnits(rec.Initial), msgTail)
+	case destroyedQty <= 0:
+		return fmt.Errorf("%w: 样品 %q 的实际销毁量 %s 毫升必须大于零%s",
+			ErrInvalid, sampleID, formatUnits(destroyedQty), msgTail)
+	}
+
+	// 只统计直接子样创建时取得的初始量；子样后续变化与孙样都不计入。
+	var directChildrenTotal int64
+	for _, childID := range rec.Children {
+		child, ok := l.Samples[childID]
+		if !ok || child == nil {
+			return fmt.Errorf("%w: 样品 %q 的直接子样 %q 不存在，无法核对销毁数量%s",
+				ErrInvalid, sampleID, childID, msgTail)
+		}
+		if child.Initial <= 0 {
+			return fmt.Errorf("%w: 样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对销毁数量%s",
+				ErrInvalid, sampleID, childID, formatUnits(child.Initial), msgTail)
+		}
+		next := directChildrenTotal + child.Initial
+		if next < 0 || next < directChildrenTotal {
+			return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，实际销毁量 %s 毫升与直接子样总量合计超出可表示范围%s",
+				ErrInvalid, sampleID, formatUnits(destroyedQty), msgTail)
+		}
+		directChildrenTotal = next
+	}
+
+	total := destroyedQty + directChildrenTotal
+	if total < 0 || total < destroyedQty {
+		return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，实际销毁量 %s 毫升与直接子样总量 %s 毫升合计超出可表示范围%s",
+			ErrInvalid, sampleID, formatUnits(destroyedQty),
+			formatUnits(directChildrenTotal), msgTail)
+	}
+	if total != rec.Initial {
+		return fmt.Errorf("%w: 样品 %q 的销毁数量与分装记录不符：初始量 %s 毫升，实际销毁量 %s 毫升，直接子样总量 %s 毫升，实际销毁量与直接子样总量之和应为 %s 毫升%s",
+			ErrInvalid, sampleID,
+			formatUnits(rec.Initial), formatUnits(destroyedQty),
+			formatUnits(directChildrenTotal), formatUnits(rec.Initial), msgTail)
 	}
 	return nil
 }
