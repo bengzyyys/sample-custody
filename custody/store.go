@@ -81,7 +81,10 @@ func Open(path string) (*Store, error) {
 // 样品的量。样品是否挂着待确认交接不影响这项检查：即使待确认交接量恰好
 // 等于错误的剩余量，数量越界的样品也必须拒绝（见 validateActiveQuantities）。
 //
-// 对带有销毁信息的样品，逐一核对数量守恒（见 validateDestroyedQuantity）：
+// 对带有销毁信息的样品，先核对销毁时间（见 validateDestroyedTime）：销毁
+// 时间缺失或为零值一律拒绝（与是否有保管历史无关），且按实际时刻不得早于
+// 该样品自身任何一条保管历史的发生时刻；随后逐一核对数量守恒（见
+// validateDestroyedQuantity）：
 // 当前剩余量必须为 0.000，实际销毁量与自身初始量都大于零，且实际销毁量
 // 加上各直接子样创建时取得的初始量之和恰好等于该样品自身的初始量。参与
 // 核对的子样关系还必须一致：子样列表中的编号对应现存样品、其来源编号
@@ -148,9 +151,12 @@ func validateRestored(l *ledger) error {
 				return err
 			}
 		}
-		// 销毁数量核对放在待确认交接核对之后：已销毁样品仍挂着待确认交接
+		// 销毁核对放在待确认交接核对之后：已销毁样品仍挂着待确认交接
 		// 本身就是损坏，沿用原有的交接恢复报错，保持与既有交接检查的兼容。
 		if rec.Destroyed != nil {
+			if err := validateDestroyedTime(id, rec); err != nil {
+				return err
+			}
 			if err := validateDestroyedQuantity(id, rec, l); err != nil {
 				return err
 			}
@@ -299,6 +305,37 @@ func validateActiveQuantities(sampleID string, rec *sampleRecord, l *ledger) err
 			ErrInvalid, sampleID,
 			formatUnits(rec.Remaining), formatUnits(directChildrenTotal), formatUnits(total),
 			formatUnits(rec.Initial), msgTail)
+	}
+	return nil
+}
+
+// validateDestroyedTime 核对一份带销毁信息的样品记录其销毁时间是否成立，
+// 与正常销毁功能（Destroy）的时间规则保持一致：
+//   - 销毁时间必须存在且非零值：缺失或零值一律拒绝，即使该样品没有任何
+//     保管历史也一样；
+//   - 销毁时间按实际时刻不得早于该样品自身任何一条保管历史的发生时刻
+//     （用 Before 判断而非比较时区偏移后的字面值）：恰好等于自身历史中
+//     最晚的时刻合法，同一时刻用不同时区表示也得到相同结果。
+//
+// 保管历史按操作发生顺序保存、不保证时间递增（例如分装记录可能最后追加
+// 却带着更早的时刻），因此逐条核对全部历史，而不是只比较末尾一条。这里
+// 只看该编号样品自己的历史：已经分出的子样或同一份数据中其他样品后来
+// 发生的交接，都不延后本样品可以销毁的时间；分装子样也按自己的历史判断。
+// 核对只读取历史，绝不因核对而重排或改写记录。任一不符都返回包装了
+// ErrInvalid 的错误，信息写明样品编号；发生时间倒置时同时给出销毁时间
+// 与冲突历史的时间，便于定位记录。
+func validateDestroyedTime(sampleID string, rec *sampleRecord) error {
+	at := rec.Destroyed.At
+	if at.IsZero() {
+		return fmt.Errorf("%w: 样品 %q 的销毁时间缺失或为零值，无法恢复",
+			ErrInvalid, sampleID)
+	}
+	for _, h := range rec.History {
+		if at.Before(h.Time) {
+			return fmt.Errorf("%w: 样品 %q 的销毁时间 %s 早于已有保管历史（%s）的时间 %s，无法恢复",
+				ErrInvalid, sampleID,
+				at.Format(time.RFC3339), h.Kind, h.Time.Format(time.RFC3339))
+		}
 	}
 	return nil
 }
