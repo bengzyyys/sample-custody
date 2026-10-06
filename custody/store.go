@@ -97,11 +97,12 @@ func Open(path string) (*Store, error) {
 //
 // 已确认交接属于保留的历史，不要求样品继续指向它，也不核对其与样品当前
 // 持有人、地点或剩余量的差异（样品后来分装、移动或销毁都不能否定当时的
-// 接收事实）；但它必须保留有效的接收信息：确认人非空且与该交接原先指定
-// 的接收人一致，接收时间存在且非零，且按实际时刻不早于交出时间（恰好
-// 相等合法，时区只影响表示）。集合中占用编号却为 null 的条目视为损坏，
-// 不能当作记录不存在。任一问题都使整个文件无法恢复，绝不只加载其中
-// 一部分，也不改动原文件。
+// 接收事实）；但它必须关联一份实际存在的样品记录，交接量必须大于零且不
+// 超过该样品自身的初始量（见 validateConfirmedReceipt），并保留有效的
+// 接收信息：确认人非空且与该交接原先指定的接收人一致，接收时间存在且
+// 非零，且按实际时刻不早于交出时间（恰好相等合法，时区只影响表示）。
+// 集合中占用编号却为 null 的条目视为损坏，不能当作记录不存在。任一问题
+// 都使整个文件无法恢复，绝不只加载其中一部分，也不改动原文件。
 func validateRestored(l *ledger) error {
 	sampleIDs := make([]string, 0, len(l.Samples))
 	for id := range l.Samples {
@@ -111,6 +112,10 @@ func validateRestored(l *ledger) error {
 	for _, id := range sampleIDs {
 		rec := l.Samples[id]
 		if rec == nil {
+			if refs := transferIDsReferencingSample(l, id); len(refs) > 0 {
+				return fmt.Errorf("%w: 样品编号 %q 已被占用但记录为 null，引用它的交接 %s 无法关联到实际样品，无法恢复",
+					ErrInvalid, id, strings.Join(quoteAll(refs), ", "))
+			}
 			return fmt.Errorf("%w: 样品编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
 		}
 		// 先核对样品自身数量是否自洽：数量越界的样品即使挂着交接量恰好
@@ -160,7 +165,16 @@ func validateRestored(l *ledger) error {
 			return fmt.Errorf("%w: 交接编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
 		}
 		if rec.Confirmed {
-			if err := validateConfirmedReceipt(rec); err != nil {
+			sample, ok := l.Samples[rec.SampleID]
+			switch {
+			case !ok:
+				return fmt.Errorf("%w: 已确认交接 %q 关联的样品 %q 不存在，无法恢复",
+					ErrInvalid, id, rec.SampleID)
+			case sample == nil:
+				return fmt.Errorf("%w: 已确认交接 %q 关联的样品 %q 记录为 null，无法恢复",
+					ErrInvalid, id, rec.SampleID)
+			}
+			if err := validateConfirmedReceipt(rec, sample); err != nil {
 				return err
 			}
 			continue
@@ -183,6 +197,29 @@ func validateRestored(l *ledger) error {
 		}
 	}
 	return nil
+}
+
+// transferIDsReferencingSample 返回所有（含已确认与待确认）关联到给定样品
+// 编号的交接编号，按编号排序，用于在样品条目损坏（如 null）时仍能指出
+// 哪些交接因此失去关联。
+func transferIDsReferencingSample(l *ledger, sampleID string) []string {
+	var ids []string
+	for id, tr := range l.Transfers {
+		if tr != nil && tr.SampleID == sampleID {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// quoteAll 把编号逐个加上 %q 引号，便于在错误信息中列出。
+func quoteAll(ids []string) []string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = fmt.Sprintf("%q", id)
+	}
+	return out
 }
 
 // validateActiveQuantities 核对一份没有销毁信息（即未销毁）的样品自身数量
@@ -345,15 +382,43 @@ func validatePendingContent(sampleID string, sample *sampleRecord, tr *transferR
 	return nil
 }
 
-// validateConfirmedReceipt 核对一条已确认交接是否保留了有效的接收事实。
-// 已确认表示样品确实完成过一次转手，因此确认人必须非空（去首尾空白后）
-// 且与该交接原先指定的接收人完全一致，接收时间必须存在且不是零时间，
-// 并按实际时刻不早于交出时间（恰好相等合法；不同时区表示同一时刻也算
-// 相等，时间倒置用 Before 判断而非比较时区偏移后的字面值）。任一不符
-// 都返回包装了 ErrInvalid 的错误，信息写明交接编号、关联样品编号以及
-// 具体问题（缺少/空白确认人、确认人不符、缺少或零值接收时间、时间倒置），
-// 绝不靠补写确认人、猜测接收时间或改回待确认来接受异常记录。
-func validateConfirmedReceipt(tr *transferRecord) error {
+// validateConfirmedReceipt 核对一条已确认交接是否记录了一次真实成立的转手。
+// 已确认交接保存的是当时发生的事实，因此它首先必须关联一份实际存在的样品
+// （由调用方保证 sample 非 nil），且交接量本身成立：
+//   - 交接量必须大于零：零量或负量的“转手”不可能发生，不能只凭确认人和
+//     接收时间齐全就恢复成已确认记录；
+//   - 交接量不得超过该样品自身的初始量。这里的上限是样品登记/创建时取得
+//     的初始量：原样取登记量，分装子样取它创建时分得的量，不能借用父样、
+//     兄弟子样或其他原样的量（子样初始 3.250 毫升却记着 4.000 毫升的已
+//     确认交接，即使父样初始量更大也必须拒绝）；交接量恰好等于自身初始量
+//     是合法边界。上限取样品自身初始量而非当前剩余量：原样曾以 10.000
+//     毫升完成交接，之后分出 3.250 毫升再以剩余的 6.750 毫升转交时，旧
+//     交接仍保留当时的 10.000 毫升，不能拿当前剩余量或多次转手量之和
+//     限制它。
+//
+// 此外确认人必须非空（去首尾空白后）且与该交接原先指定的接收人完全一致，
+// 接收时间必须存在且不是零时间，并按实际时刻不早于交出时间（恰好相等
+// 合法；不同时区表示同一时刻也算相等，时间倒置用 Before 判断而非比较时区
+// 偏移后的字面值）。任一不符都返回包装了 ErrInvalid 的错误，信息写明交接
+// 编号、关联样品编号以及具体问题（样品缺失由调用方先行处理；交接量为零/
+// 负、交接量超过样品自身初始量、缺少/空白确认人、确认人不符、缺少或零值
+// 接收时间、时间倒置）；数量不符时同时以三位小数毫升展示交接量与样品
+// 自身初始量。绝不靠删除问题交接、补登记样品或调整数量来接受异常记录。
+func validateConfirmedReceipt(tr *transferRecord, sample *sampleRecord) error {
+	switch {
+	case tr.Qty == 0:
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的交接量为 0.000 毫升，交接量必须大于零，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID)
+	case tr.Qty < 0:
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的交接量 %s 毫升不能为负，交接量必须大于零，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID, formatUnits(tr.Qty))
+	case sample.Initial <= 0:
+		return fmt.Errorf("%w: 已确认交接 %q 关联的样品 %q 自身初始量 %s 毫升不大于零，无法核对交接量，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID, formatUnits(sample.Initial))
+	case tr.Qty > sample.Initial:
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的交接量 %s 毫升超过样品自身初始量 %s 毫升，交接量不得大于样品自身初始量，无法恢复",
+			ErrInvalid, tr.ID, tr.SampleID, formatUnits(tr.Qty), formatUnits(sample.Initial))
+	}
 	switch {
 	case tr.ConfirmedBy == "":
 		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）缺少确认人，无法恢复",
