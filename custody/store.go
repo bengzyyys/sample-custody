@@ -94,6 +94,15 @@ func Open(path string) (*Store, error) {
 // 当时已经分出的量，不能改用子样当前剩余量，孙样也不重复计入；没有分出
 // 子样的样品，实际销毁量就应等于自己的初始量。
 //
+// 时间与数量都成立后，还核对销毁操作人、销毁地点与该样品自身保留的最后
+// 持有人、当前地点是否一致（见 validateDestroyedCustody）：销毁后持有人
+// 和地点保留为销毁前的最后记录，两处信息互相矛盾会让查询同时返回冲突
+// 内容，必须按无效数据拒绝。核对只看同一编号样品自身的最后记录，父样与
+// 分装子样可由不同人员在不同地点分别销毁，子样后来换人、移动不影响父样；
+// 早期登记、交接历史中的人员、地点与最后记录不同也不构成拒绝理由。销毁
+// 操作人或地点缺失、为空或只有空白同样无效，不能因样品对应字段也为空而
+// 当作一致；已保存的非空文本按原文核对，不通过去掉空白来接受不同内容。
+//
 // 样品的非空 PendingID 必须指向一条实际存在、尚未确认、且属于该样品的
 // 交接；每条尚未确认的交接也必须对应一份实际存在、且 PendingID 正好指向
 // 它的样品。待确认交接表示样品当前全部剩余量尚待指定人员接收，因此其
@@ -158,6 +167,9 @@ func validateRestored(l *ledger) error {
 				return err
 			}
 			if err := validateDestroyedQuantity(id, rec, l); err != nil {
+				return err
+			}
+			if err := validateDestroyedCustody(id, rec); err != nil {
 				return err
 			}
 		}
@@ -518,6 +530,53 @@ func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) er
 			ErrInvalid, sampleID,
 			formatUnits(rec.Initial), formatUnits(destroyedQty),
 			formatUnits(directChildrenTotal), formatUnits(rec.Initial), msgTail)
+	}
+	return nil
+}
+
+// validateDestroyedCustody 核对一份带销毁信息的样品，其销毁操作人、销毁地点
+// 是否与该样品保留的最后持有人、当前地点一致。销毁处理的是样品当时的全部
+// 剩余量，销毁成功后样品的持有人和地点保留为销毁前的最后记录（见 Destroy），
+// 因此落盘的销毁信息写着的操作人、地点必须分别与样品记录的当前持有人、
+// 当前地点完全相同；两者互相矛盾时，查询会同时返回冲突信息，重新打开必须
+// 按损坏数据拒绝。
+//
+// 核对只针对同一编号样品自身的最后记录（rec.Holder/rec.Location）：父样与
+// 分装子样可以由不同人员在不同地点分别保管或销毁，子样后来换人、移动不
+// 影响父样的销毁信息；该样品早期登记、交接历史里的人员、地点也允许与最后
+// 记录不同，这些差异都不是拒绝理由。
+//
+// 销毁操作人、地点缺失、为空或只有空白一律无效：不能因为样品对应的持有人
+// 或地点也为空就把空值视为一致。两边都有非空文本时按原文逐字比较，绝不
+// 通过去掉首尾空白来接受 " 李四 " 与 "李四" 之类的不同内容；任一项缺失/
+// 空白或不一致都返回包装了 ErrInvalid 的错误，信息写明样品编号以及有问题
+// 的是操作人还是地点——两边都有值时同时给出销毁信息与样品记录各自的值，
+// 缺失或只有空白时说明具体原因。先核对操作人再核对地点，任意一项不一致都
+// 足以拒绝整份文件。
+func validateDestroyedCustody(sampleID string, rec *sampleRecord) error {
+	const msgTail = "，无法恢复"
+	d := rec.Destroyed
+	switch {
+	case d.Operator == "":
+		return fmt.Errorf("%w: 样品 %q 的销毁信息缺少操作人，销毁操作人必须与样品保留的最后持有人 %q 完全一致%s",
+			ErrInvalid, sampleID, rec.Holder, msgTail)
+	case strings.TrimSpace(d.Operator) == "":
+		return fmt.Errorf("%w: 样品 %q 的销毁操作人只有空白，必须与样品保留的最后持有人 %q 完全一致%s",
+			ErrInvalid, sampleID, rec.Holder, msgTail)
+	case d.Operator != rec.Holder:
+		return fmt.Errorf("%w: 样品 %q 的销毁操作人 %q 与样品保留的最后持有人 %q 不一致，销毁操作人必须与最后持有人完全一致%s",
+			ErrInvalid, sampleID, d.Operator, rec.Holder, msgTail)
+	}
+	switch {
+	case d.Location == "":
+		return fmt.Errorf("%w: 样品 %q 的销毁信息缺少销毁地点，销毁地点必须与样品保留的当前地点 %q 完全一致%s",
+			ErrInvalid, sampleID, rec.Location, msgTail)
+	case strings.TrimSpace(d.Location) == "":
+		return fmt.Errorf("%w: 样品 %q 的销毁地点只有空白，必须与样品保留的当前地点 %q 完全一致%s",
+			ErrInvalid, sampleID, rec.Location, msgTail)
+	case d.Location != rec.Location:
+		return fmt.Errorf("%w: 样品 %q 的销毁地点 %q 与样品保留的当前地点 %q 不一致，销毁地点必须与当前地点完全一致%s",
+			ErrInvalid, sampleID, d.Location, rec.Location, msgTail)
 	}
 	return nil
 }
