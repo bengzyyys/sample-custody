@@ -81,14 +81,24 @@ func Open(path string) (*Store, error) {
 // 样品的量。样品是否挂着待确认交接不影响这项检查：即使待确认交接量恰好
 // 等于错误的剩余量，数量越界的样品也必须拒绝（见 validateActiveQuantities）。
 //
-// 对带有销毁信息的样品，逐一核对数量守恒（见 validateDestroyedQuantity）：
-// 当前剩余量必须为 0.000，实际销毁量与自身初始量都大于零，且实际销毁量
-// 加上各直接子样创建时取得的初始量之和恰好等于该样品自身的初始量。参与
-// 核对的子样关系还必须一致：子样列表中的编号对应现存样品、其来源编号
-// 指向本样品且不重复，来源编号指向本样品的子样也必须全部列在其中；重复
-// 列入、来源不符或漏列都按无效数据拒绝，不能只凭数量等式接受。这里只
-// 统计直接子样创建时的量：子样后来继续分装、转交或销毁都不改变原样
-// 当时已经分出的量，不能改用子样当前剩余量，孙样也不重复计入；没有分出
+// 对带有销毁信息的样品，先核对销毁时间（见 validateDestroyedTime），再逐一
+// 核对数量守恒（见 validateDestroyedQuantity）：销毁时间缺失（无 at 字段或
+// 为 null）或为零值时刻都必须拒绝，即使该样品没有任何保管历史也一样；
+// 销毁时间按实际时刻不得早于该样品自身任何一条保管历史的发生时刻（恰好
+// 等于最晚历史时刻合法，不同时区表示同一时刻也按相等处理）。保管历史按
+// 操作发生顺序保存、不保证时间递增，这里逐条按实际时刻比较而不是只看
+// 历史末尾，也绝不因核对而重排或改写任何历史记录；核对范围只含该编号
+// 样品自己的历史，已经分出的子样或同文件其他样品之后的交接不推迟它可以
+// 销毁的时间（子样带销毁信息时按子样自己的历史独立判断）。时间不成立时
+// 即使销毁量与分装数量完全守恒也必须拒绝，不能恢复成“先销毁、后接收”
+// 的记录。时间合法的已销毁样品继续核对数量守恒：当前剩余量必须为
+// 0.000，实际销毁量与自身初始量都大于零，且实际销毁量加上各直接子样
+// 创建时取得的初始量之和恰好等于该样品自身的初始量。参与核对的子样
+// 关系还必须一致：子样列表中的编号对应现存样品、其来源编号指向本样品
+// 且不重复，来源编号指向本样品的子样也必须全部列在其中；重复列入、
+// 来源不符或漏列都按无效数据拒绝，不能只凭数量等式接受。这里只统计
+// 直接子样创建时的量：子样后来继续分装、转交或销毁都不改变原样当时
+// 已经分出的量，不能改用子样当前剩余量，孙样也不重复计入；没有分出
 // 子样的样品，实际销毁量就应等于自己的初始量。
 //
 // 样品的非空 PendingID 必须指向一条实际存在、尚未确认、且属于该样品的
@@ -148,9 +158,14 @@ func validateRestored(l *ledger) error {
 				return err
 			}
 		}
-		// 销毁数量核对放在待确认交接核对之后：已销毁样品仍挂着待确认交接
+		// 销毁核对放在待确认交接核对之后：已销毁样品仍挂着待确认交接
 		// 本身就是损坏，沿用原有的交接恢复报错，保持与既有交接检查的兼容。
 		if rec.Destroyed != nil {
+			// 先核对销毁时间，再核对数量：时间缺失、为零或早于自身已有
+			// 保管历史的销毁记录，即使销毁量与分装数量完全守恒也必须拒绝。
+			if err := validateDestroyedTime(id, rec); err != nil {
+				return err
+			}
 			if err := validateDestroyedQuantity(id, rec, l); err != nil {
 				return err
 			}
@@ -299,6 +314,50 @@ func validateActiveQuantities(sampleID string, rec *sampleRecord, l *ledger) err
 			ErrInvalid, sampleID,
 			formatUnits(rec.Remaining), formatUnits(directChildrenTotal), formatUnits(total),
 			formatUnits(rec.Initial), msgTail)
+	}
+	return nil
+}
+
+// validateDestroyedTime 核对一份带销毁信息的样品，其销毁时间是否成立。
+// 与正常销毁功能相同的规则也要在恢复文件时强制执行：
+//   - 销毁时间必须存在：文件中没有 at 字段或 at 为 null 报“缺失”，
+//     at 明确是零值时刻报“零值”；即使该样品一条保管历史都没有，缺失
+//     或零值也同样拒绝；
+//   - 销毁时间按实际时刻不得早于该样品自身任何一条保管历史的发生时刻。
+//     恰好等于自身历史中最晚的时刻合法；时间用 Before 比较，不同时区
+//     表示同一实际时刻结果相同，不能按时区字面值判断。
+//
+// 保管历史按操作发生顺序保存、不保证时间递增，因此必须逐条比较而不是只
+// 看历史末尾；本函数只读取历史，绝不重排或改写任何一条记录。核对范围只
+// 含该编号样品自己的历史：已分出的子样或同文件其他样品之后的交接都不推
+// 迟它可以销毁的时间，子样若带销毁信息则按子样自己的历史独立核对。时间
+// 不成立时即使销毁数量与分装数量完全守恒，也返回包装了 ErrInvalid 的
+// 错误，信息写明样品编号以及缺失、零值或早于历史的原因；时间倒置时同时
+// 给出销毁时间与冲突历史的时刻（取晚于销毁时间的最晚历史时刻，即真正的
+// 下界），统一按 RFC3339 展示。
+func validateDestroyedTime(sampleID string, rec *sampleRecord) error {
+	const msgTail = "，无法恢复"
+	d := rec.Destroyed
+	switch {
+	case !d.atPresent:
+		return fmt.Errorf("%w: 样品 %q 的销毁时间缺失（销毁信息中没有 at 字段或为 null）%s",
+			ErrInvalid, sampleID, msgTail)
+	case d.At.IsZero():
+		return fmt.Errorf("%w: 样品 %q 的销毁时间为零值，销毁时间必须是实际发生时刻%s",
+			ErrInvalid, sampleID, msgTail)
+	}
+	// 历史不保证时间递增，逐条按实际时刻比较；记录晚于销毁时间的最晚
+	// 历史时刻作为冲突时间，定位时与“历史中最晚时刻”一致。
+	var conflict time.Time
+	for _, h := range rec.History {
+		if d.At.Before(h.Time) && h.Time.After(conflict) {
+			conflict = h.Time
+		}
+	}
+	if !conflict.IsZero() {
+		return fmt.Errorf("%w: 样品 %q 的销毁时间 %s 早于其保管历史的发生时刻 %s，样品不能在该历史事件发生之前销毁%s",
+			ErrInvalid, sampleID,
+			d.At.Format(time.RFC3339), conflict.Format(time.RFC3339), msgTail)
 	}
 	return nil
 }

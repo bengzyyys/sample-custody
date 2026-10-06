@@ -1,6 +1,7 @@
 package custody
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -118,6 +119,31 @@ type destructionRecord struct {
 	At       time.Time `json:"at"`
 	Reason   string    `json:"reason"`
 	Qty      int64     `json:"qty"`
+
+	// atPresent 仅由 UnmarshalJSON 在恢复文件时设置，区分文件中“没有 at
+	// 字段（或为 null）”与“at 解析为零值时刻”两种损坏；内存中经公开操作
+	// 产生的记录不依赖它，也不会落盘（未导出字段不参与序列化）。
+	atPresent bool
+}
+
+// UnmarshalJSON 让恢复流程能区分销毁时间缺失（无 at 字段或为 null）与
+// 明确给出零值时刻：value 类型 time.Time 本身无法表达“字段不存在”，故用
+// 外层同标签的 *time.Time 承接 at，其余字段照常反序列化。
+func (d *destructionRecord) UnmarshalJSON(raw []byte) error {
+	type destructionAlias destructionRecord
+	var v struct {
+		destructionAlias
+		At *time.Time `json:"at"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return err
+	}
+	*d = destructionRecord(v.destructionAlias)
+	if v.At != nil {
+		d.At = *v.At
+		d.atPresent = true
+	}
+	return nil
 }
 
 type historyRecord struct {
