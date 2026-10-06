@@ -269,29 +269,19 @@ func validateActiveQuantities(sampleID string, rec *sampleRecord, l *ledger) err
 			ErrInvalid, sampleID, formatUnits(rec.Remaining), formatUnits(rec.Initial), msgTail)
 	}
 
-	// 直接分出总量以子样记录的来源编号为准：任何 ParentID 指向本样品的
-	// 现存子样都计入，即使本样品的子样列表没有列出它；只取子样创建时取得
-	// 的初始量。子样后续分装、交接、销毁与孙样都不影响这里的统计。
-	childIDs := make([]string, 0)
-	for otherID, other := range l.Samples {
-		if other != nil && other.ParentID == sampleID {
-			childIDs = append(childIDs, otherID)
-		}
-	}
-	sort.Strings(childIDs)
-	var directChildrenTotal int64
-	for _, childID := range childIDs {
-		childInitial := l.Samples[childID].Initial
-		if childInitial <= 0 {
-			return fmt.Errorf("%w: 未销毁样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对分出数量%s",
-				ErrInvalid, sampleID, childID, formatUnits(childInitial), msgTail)
-		}
-		next := directChildrenTotal + childInitial
-		if next < 0 || next < directChildrenTotal {
-			return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升与直接分出总量合计超出可表示范围%s",
-				ErrInvalid, sampleID, formatUnits(rec.Remaining), msgTail)
-		}
-		directChildrenTotal = next
+	// 直接分出总量的统计规则在三处核对（未销毁数据恢复、销毁前守恒、已销毁
+	// 数据恢复）中完全一致，规则本身只维护一份：directChildrenBySource 按
+	// 来源编号认定直接子样（漏列也计入），sumDirectChildInitials 只累加各
+	// 子样创建时取得的初始量并识别非正初始量与累加溢出；本函数再按“恢复未
+	// 销毁旧数据”的语义把问题渲染成 ErrInvalid。
+	directChildrenTotal, badChild, overflow := sumDirectChildInitials(l, directChildrenBySource(l, sampleID))
+	switch {
+	case badChild != "":
+		return fmt.Errorf("%w: 未销毁样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对分出数量%s",
+			ErrInvalid, sampleID, badChild, formatUnits(l.Samples[badChild].Initial), msgTail)
+	case overflow:
+		return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升与直接分出总量合计超出可表示范围%s",
+			ErrInvalid, sampleID, formatUnits(rec.Remaining), msgTail)
 	}
 
 	total := rec.Remaining + directChildrenTotal
@@ -514,20 +504,16 @@ func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) er
 	}
 
 	// 只统计关系一致的直接子样创建时取得的初始量；子样后续变化与孙样都
-	// 不计入。
-	var directChildrenTotal int64
-	for _, childID := range rec.Children {
-		child := l.Samples[childID]
-		if child.Initial <= 0 {
-			return fmt.Errorf("%w: 样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对销毁数量%s",
-				ErrInvalid, sampleID, childID, formatUnits(child.Initial), msgTail)
-		}
-		next := directChildrenTotal + child.Initial
-		if next < 0 || next < directChildrenTotal {
-			return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，实际销毁量 %s 毫升与直接子样总量合计超出可表示范围%s",
-				ErrInvalid, sampleID, formatUnits(destroyedQty), msgTail)
-		}
-		directChildrenTotal = next
+	// 不计入。累加规则（非正初始量、累加溢出）由 sumDirectChildInitials
+	// 统一维护，这里按恢复失败的语义渲染为 ErrInvalid。
+	directChildrenTotal, badChild, childOverflow := sumDirectChildInitials(l, rec.Children)
+	switch {
+	case badChild != "":
+		return fmt.Errorf("%w: 样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对销毁数量%s",
+			ErrInvalid, sampleID, badChild, formatUnits(l.Samples[badChild].Initial), msgTail)
+	case childOverflow:
+		return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，实际销毁量 %s 毫升与直接子样总量合计超出可表示范围%s",
+			ErrInvalid, sampleID, formatUnits(destroyedQty), msgTail)
 	}
 
 	total := destroyedQty + directChildrenTotal
@@ -545,12 +531,13 @@ func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) er
 	return nil
 }
 
-// directChildrenTotalBySource 按子样记录的来源编号（ParentID）统计全部直接
-// 子样创建时取得的初始量之和。子样后续继续分装、交接或销毁都不改变来源
-// 样品当时分出的量，因此只取 child.Initial，绝不改用其当前剩余量；孙样
-// （ParentID 指向其他样品）与同一份数据里的其他原样、兄弟子样、父样都不
-// 参与。任一直接子样初始量不大于零或累加溢出时返回错误。
-func directChildrenTotalBySource(l *ledger, sampleID string) (int64, error) {
+// directChildrenBySource 按子样记录的来源编号（ParentID）找出全部直接子样
+// 的编号：全数据中任何来源编号指向 sampleID 的现存（非 nil）样品都算，结果
+// 按编号排序，使错误说明与累加顺序确定。子样是否被列在来源样品的 Children
+// 列表中不影响这里的认定——未销毁旧数据允许列表漏列，但分出量仍要计入。
+// 孙样（ParentID 指向其他样品）、父样、兄弟子样与同一份数据里的其他原样
+// 都不会被选中。
+func directChildrenBySource(l *ledger, sampleID string) []string {
 	childIDs := make([]string, 0)
 	for otherID, other := range l.Samples {
 		if other != nil && other.ParentID == sampleID {
@@ -558,21 +545,37 @@ func directChildrenTotalBySource(l *ledger, sampleID string) (int64, error) {
 		}
 	}
 	sort.Strings(childIDs)
-	var total int64
+	return childIDs
+}
+
+// sumDirectChildInitials 按给定的直接子样编号顺序，累加各子样创建时取得的
+// 初始量（child.Initial）。这是“直接分出总量”唯一的累加规则：只取创建时
+// 的初始量，绝不改用子样当前剩余量，因此子样后来继续分装、换持有人、换
+// 地点或独立销毁都不改变来源样品已经分出的量。
+//
+// 返回累加结果，以及检测到的问题编号：badChild 非空表示该直接子样的初始
+// 量不大于零（同时返回此前已累加的部分和，调用方不使用）；overflow 为真
+// 表示逐份累加时超出 int64 可表示范围。badChild 优先于 overflow。如何把
+// 这两类问题（以及随后的合计溢出/守恒缺口）渲染成错误，由三个调用方按各
+// 自场景的错误分类与措辞处理，本函数不绑定任何错误类型或说明。
+//
+// 调用方必须保证 childIDs 中每个编号都对应现存样品，且需要统计每份只计
+// 一次；已销毁数据的两个调用点已先通过 checkDirectChildRelationship 保证
+// 列表无重复、来源一致，未销毁数据恢复与销毁前核对则传入
+// directChildrenBySource 的结果（天然无重复）。
+func sumDirectChildInitials(l *ledger, childIDs []string) (total int64, badChild string, overflow bool) {
 	for _, childID := range childIDs {
 		childInitial := l.Samples[childID].Initial
 		if childInitial <= 0 {
-			return 0, fmt.Errorf("%w: 样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对销毁数量",
-				ErrInvalid, sampleID, childID, formatUnits(childInitial))
+			return total, childID, false
 		}
 		next := total + childInitial
 		if next < 0 || next < total {
-			return 0, fmt.Errorf("%w: 样品 %q 的剩余量与直接分出总量合计超出可表示范围，无法销毁",
-				ErrInvalid, sampleID)
+			return total, "", true
 		}
 		total = next
 	}
-	return total, nil
+	return total, "", false
 }
 
 // validateDestroyConservation 是销毁前的数量守恒核对。销毁只能处理样品
@@ -588,10 +591,12 @@ func directChildrenTotalBySource(l *ledger, sampleID string) (int64, error) {
 // 因此仍能打开和查询；但一旦销毁，记录就必须恰好守恒，所以有缺口的
 // 旧样品只能继续作为未销毁记录保留，不能通过销毁“结清”。
 //
-// 直接分出总量按子样记录的来源编号认定、只计各直接子样创建时取得的初始
-// 量（见 directChildrenTotalBySource）：分装子样申请销毁时按它自身创建时
-// 取得的初始量核对，孙样不重复计算，其他原样、兄弟子样和父样都不参与；
-// 没有直接子样时，剩余量必须等于自身初始量，哪怕只缺 0.001 毫升也拒绝。
+// 直接分出总量的认定与累加规则只有一份实现（见 directChildrenBySource 与
+// sumDirectChildInitials），与重新打开时的两处数量核对共用：按子样记录的
+// 来源编号认定、只计各直接子样创建时取得的初始量，分装子样申请销毁时按
+// 它自身创建时取得的初始量核对，孙样不重复计算，其他原样、兄弟子样和
+// 父样都不参与；没有直接子样时，剩余量必须等于自身初始量，哪怕只缺
+// 0.001 毫升也拒绝。
 // 子样列表与来源编号的关系还必须一致：关系规则只有一份实现（见
 // checkDirectChildRelationship），与重新打开已销毁记录时的恢复核对共用，
 // 这里按销毁冲突的语义渲染为 ErrConflict。公开操作维护的列表始终一致，
@@ -608,9 +613,16 @@ func validateDestroyConservation(sampleID string, rec *sampleRecord, l *ledger) 
 		return prob.asDestroyConflictError(sampleID)
 	}
 
-	directChildrenTotal, err := directChildrenTotalBySource(l, sampleID)
-	if err != nil {
-		return err
+	// 直接分出量的认定与累加规则与恢复核对共用同一份实现；非正初始量按
+	// 原有分类（ErrInvalid）拒绝，其余守恒缺口按销毁冲突（ErrConflict）。
+	directChildrenTotal, badChild, childOverflow := sumDirectChildInitials(l, directChildrenBySource(l, sampleID))
+	switch {
+	case badChild != "":
+		return fmt.Errorf("%w: 样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对销毁数量",
+			ErrInvalid, sampleID, badChild, formatUnits(l.Samples[badChild].Initial))
+	case childOverflow:
+		return fmt.Errorf("%w: 样品 %q 的剩余量与直接分出总量合计超出可表示范围，无法销毁",
+			ErrConflict, sampleID)
 	}
 	total := rec.Remaining + directChildrenTotal
 	if total < 0 || total < directChildrenTotal {
