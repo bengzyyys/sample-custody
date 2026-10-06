@@ -291,17 +291,24 @@ func validateActiveQuantities(sampleID string, rec *sampleRecord, l *ledger) err
 		return prob.asActiveRestoreError(sampleID, rec.Remaining)
 	}
 
-	total := rec.Remaining + directChildrenTotal
-	if total < 0 || total < directChildrenTotal {
+	// 参与核对数量（这里取当前剩余量）与直接分出总量相加、合计溢出判断及
+	// 与自身初始量的比较同样只有一份实现（见 checkConservationTotal）；
+	// 未销毁旧记录保留“合计可以小于初始量”的接受约定，只拒绝合计大于初始
+	// 量（含相加溢出）的记录。这里按“未销毁样品恢复失败”的语义渲染。
+	res := checkConservationTotal(rec.Remaining, directChildrenTotal, rec.Initial, false)
+	switch res.outcome {
+	case accountedOverflow:
 		return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升与直接分出总量 %s 毫升合计超出可表示范围%s",
 			ErrInvalid, sampleID, formatUnits(rec.Remaining),
 			formatUnits(directChildrenTotal), msgTail)
-	}
-	if total > rec.Initial {
+	case accountedAboveInitial:
 		return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升与直接分出总量 %s 毫升之和为 %s 毫升，超过自身初始量 %s 毫升，剩余量与直接分出总量之和不得大于初始量%s",
 			ErrInvalid, sampleID,
-			formatUnits(rec.Remaining), formatUnits(directChildrenTotal), formatUnits(total),
+			formatUnits(rec.Remaining), formatUnits(directChildrenTotal), formatUnits(res.total),
 			formatUnits(rec.Initial), msgTail)
+	case accountedEqual, accountedBelowInitial:
+		// 恰好守恒正常恢复；合计小于初始量是旧记录保留的差额，恢复阶段不
+		// 强行补齐（这类记录仍不能销毁，销毁前核对走 requireExact 分支）。
 	}
 	return nil
 }
@@ -519,13 +526,17 @@ func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) er
 		return prob.asDestroyedRestoreError(sampleID, destroyedQty)
 	}
 
-	total := destroyedQty + directChildrenTotal
-	if total < 0 || total < destroyedQty {
+	// 参与核对数量（恢复时取保存的实际销毁量，而非已归零的当前剩余量）与
+	// 直接分出总量相加、合计溢出判断及与自身初始量的精确比较，与发起销毁前
+	// 的核对共用同一份实现（见 checkConservationTotal），同一条守恒规则不
+	// 再分别维护；这里按“已销毁数据恢复失败”的语义渲染为 ErrInvalid。
+	res := checkConservationTotal(destroyedQty, directChildrenTotal, rec.Initial, true)
+	switch res.outcome {
+	case accountedOverflow:
 		return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，实际销毁量 %s 毫升与直接子样总量 %s 毫升合计超出可表示范围%s",
 			ErrInvalid, sampleID, formatUnits(destroyedQty),
 			formatUnits(directChildrenTotal), msgTail)
-	}
-	if total != rec.Initial {
+	case accountedNotEqual:
 		return fmt.Errorf("%w: 样品 %q 的销毁数量与分装记录不符：初始量 %s 毫升，实际销毁量 %s 毫升，直接子样总量 %s 毫升，实际销毁量与直接子样总量之和应为 %s 毫升%s",
 			ErrInvalid, sampleID,
 			formatUnits(rec.Initial), formatUnits(destroyedQty),
@@ -691,6 +702,79 @@ func (p *directChildrenSumProblem) asDestroyCheckError(sampleID string) error {
 	}
 }
 
+// accountedOutcomeKind 标识“参与核对数量 + 直接分出总量”这一合计相对样品
+// 自身初始量的核对结果。相加、溢出判断与这份比较只有一处实现（见
+// checkConservationTotal），由打开未销毁数据、发起销毁、打开已销毁数据
+// 三个场景共用；各场景再按自己的失败语义把结果渲染成原有分类与说明。
+type accountedOutcomeKind int
+
+const (
+	// accountedEqual：合计恰好等于自身初始量（数量守恒）。
+	accountedEqual accountedOutcomeKind = iota
+	// accountedBelowInitial：合计小于自身初始量（数量有缺口）。这只在允许
+	// 保留差额的未销毁旧记录恢复场景合法；发起销毁与已销毁记录恢复都要求
+	// 恰好守恒，会把它按各自语义拒绝。
+	accountedBelowInitial
+	// accountedAboveInitial：合计大于自身初始量。
+	accountedAboveInitial
+	// accountedNotEqual：在要求“恰好守恒”的场景（发起销毁、已销毁记录
+	// 恢复）里，合计不等于自身初始量，即 accountedBelowInitial 或
+	// accountedAboveInitial 二者之一；调用方无需区分方向。
+	accountedNotEqual
+	// accountedOverflow：参与量与直接分出总量相加超出 int64 可表示范围，
+	// 绝不能把回绕后的较小数量当作合法合计继续比较。
+	accountedOverflow
+)
+
+// conservationTotalResult 是 checkConservationTotal 的核对结果。outcome 为
+// 结论；total 仅在未溢出时有意义，保存参与量与直接分出总量的精确合计，供
+// 调用方在错误说明中展示合计或计算缺口，避免相加逻辑在各处重复。
+type conservationTotalResult struct {
+	outcome accountedOutcomeKind
+	total   int64
+}
+
+// checkConservationTotal 核对“参与守恒核对的数量 accountedQty 加上已经直接
+// 分出的总量 directChildrenTotal”相对样品自身初始量 initial 的关系，是这条
+// 数量守恒规则中“最终合计、超出支持范围判断、与初始量比较”的唯一实现，
+// 三个使用场景都只维护这一份：
+//   - 发起销毁（见 validateDestroyConservation）：accountedQty 取样品当前
+//     全部剩余量，要求合计恰好等于自身初始量；
+//   - 重新打开已销毁记录（见 validateDestroyedQuantity）：accountedQty 取
+//     保存的实际销毁量，绝不能拿已经归零的当前剩余量代替，同样要求恰好
+//     守恒；
+//   - 重新打开未销毁旧记录（见 validateActiveQuantities）：accountedQty 取
+//     当前剩余量，沿用旧约定允许合计小于初始量，只拒绝合计大于初始量。
+//
+// directChildrenTotal 必须来自共同统计规则 sumDirectChildrenInitial：每份
+// 直接子样只计创建时取得的初始量，子样后续分装、交接或销毁都不改变这笔
+// 量，孙样与其他样品不参与；分装子样核对时它自身的初始量就是 initial。
+//
+// 相加严格检测 int64 溢出（任一操作数可能为负，因此同时检查结果变负或相对
+// 两个加数变小），一旦溢出就返回 accountedOverflow，不能把回绕后的较小
+// 数量当作合法合计；上限附近恰好守恒（合计 == math.MaxInt64 == initial）
+// 必须准确判为守恒。requireExact 为 true 时要求合计恰好等于初始量，小于或
+// 大于都归为 accountedNotEqual；为 false 时小于初始量判为
+// accountedBelowInitial（调用方据此放行有缺口的未销毁旧记录），大于判为
+// accountedAboveInitial。本函数只做计算与判定，不带任何错误分类或措辞，
+// 由调用方按场景渲染。
+func checkConservationTotal(accountedQty, directChildrenTotal, initial int64, requireExact bool) conservationTotalResult {
+	total := accountedQty + directChildrenTotal
+	if total < 0 || total < accountedQty || total < directChildrenTotal {
+		return conservationTotalResult{outcome: accountedOverflow}
+	}
+	switch {
+	case total == initial:
+		return conservationTotalResult{outcome: accountedEqual, total: total}
+	case requireExact:
+		return conservationTotalResult{outcome: accountedNotEqual, total: total}
+	case total < initial:
+		return conservationTotalResult{outcome: accountedBelowInitial, total: total}
+	default:
+		return conservationTotalResult{outcome: accountedAboveInitial, total: total}
+	}
+}
+
 // validateDestroyConservation 是销毁前的数量守恒核对。销毁只能处理样品
 // 当时的全部剩余量，落盘后的销毁记录在重新打开时必须满足“实际销毁量 +
 // 直接分出总量 == 自身初始量”，而实际销毁量就是当前剩余量。因此发起销毁
@@ -727,24 +811,29 @@ func validateDestroyConservation(sampleID string, rec *sampleRecord, l *ledger) 
 
 	// 直接分出总量的枚举、累计与拒绝规则与另外两个场景共用同一份实现（见
 	// sumDirectChildrenInitial），这里按销毁前核对的语义渲染：子样初始量
-	// 非法、子样初始量累加溢出沿用原 ErrInvalid 分类；剩余量与之相加再溢出
-	// 或数量有缺口则属于状态冲突，按 ErrConflict 处理。
+	// 非法、子样初始量累加溢出沿用原 ErrInvalid 分类。
 	directChildrenTotal, prob := sumDirectChildrenInitial(l, sampleID)
 	if prob != nil {
 		return prob.asDestroyCheckError(sampleID)
 	}
-	total := rec.Remaining + directChildrenTotal
-	if total < 0 || total < directChildrenTotal {
+
+	// 参与核对数量（发起销毁时取样品当前全部剩余量）与直接分出总量相加、
+	// 合计溢出判断及与自身初始量的精确比较，与重新打开已销毁记录时的恢复
+	// 核对共用同一份实现（见 checkConservationTotal），同一条守恒规则只维护
+	// 这一份：相加再溢出按状态冲突 ErrConflict 处理，合计与初始量不相等
+	// （数量有缺口或超出）同样按 ErrConflict 拒绝，并给出缺口。
+	res := checkConservationTotal(rec.Remaining, directChildrenTotal, rec.Initial, true)
+	switch res.outcome {
+	case accountedOverflow:
 		return fmt.Errorf("%w: 样品 %q 的剩余量 %s 毫升与直接分出总量 %s 毫升合计超出可表示范围，不能销毁",
 			ErrConflict, sampleID,
 			formatUnits(rec.Remaining), formatUnits(directChildrenTotal))
-	}
-	if total != rec.Initial {
-		gap := rec.Initial - total
+	case accountedNotEqual:
+		gap := rec.Initial - res.total
 		return fmt.Errorf("%w: 样品 %q 数量不守恒，不能销毁：自身初始量 %s 毫升，当前剩余量 %s 毫升，已直接分出总量 %s 毫升，剩余量与直接分出总量之和为 %s 毫升，距初始量尚有 %s 毫升缺口；请先核对数量后再销毁",
 			ErrConflict, sampleID,
 			formatUnits(rec.Initial), formatUnits(rec.Remaining),
-			formatUnits(directChildrenTotal), formatUnits(total), formatUnits(gap))
+			formatUnits(directChildrenTotal), formatUnits(res.total), formatUnits(gap))
 	}
 	return nil
 }
