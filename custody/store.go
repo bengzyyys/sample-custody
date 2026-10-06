@@ -74,10 +74,13 @@ func Open(path string) (*Store, error) {
 //
 // 没有销毁信息的样品仍视为未销毁（不会仅凭 0.000 补出销毁记录），但它的
 // 数量必须自洽：自身初始量必须大于零，剩余量可以为零却不能为负、也不能
-// 超过自身初始量。这一规则同时适用于登记的原样和分装产生的子样；子样的
-// 上限是它自己创建时取得的初始量，不能借用父样或其他样品的量。样品是否
-// 挂着待确认交接不影响这项检查：即使待确认交接量恰好等于错误的剩余量，
-// 数量越界的样品也必须拒绝（见 validateActiveQuantities）。
+// 超过自身初始量；剩余量加上直接分出的总量也不得超过自身初始量。直接子样
+// 按子样记录中的来源编号认定，每份只计其创建时取得的初始量，子样后来继续
+// 分装、交接或销毁都不减少来源样品当时已经分出的量，孙样不计入祖父样。
+// 这一规则同时适用于登记的原样和分装产生的子样；子样的上限是它自己创建时
+// 取得的初始量，不能借用父样或其他样品的量。样品是否挂着待确认交接不影响
+// 这项检查：即使待确认交接量恰好等于错误的剩余量，数量越界的样品也必须
+// 拒绝（见 validateActiveQuantities）。
 //
 // 对带有销毁信息的样品，逐一核对数量守恒（见 validateDestroyedQuantity）：
 // 当前剩余量必须为 0.000，实际销毁量与自身初始量都大于零，且实际销毁量
@@ -121,7 +124,7 @@ func validateRestored(l *ledger) error {
 		// 先核对样品自身数量是否自洽：数量越界的样品即使挂着交接量恰好
 		// 一致的待确认交接，也不能被交接检查放行，必须按数量规则拒绝。
 		if rec.Destroyed == nil {
-			if err := validateActiveQuantities(id, rec); err != nil {
+			if err := validateActiveQuantities(id, rec, l); err != nil {
 				return err
 			}
 		}
@@ -227,14 +230,22 @@ func quoteAll(ids []string) []string {
 // 剩余量 0.000 补出销毁记录，但它的数量必须自洽：
 //   - 自身初始量必须大于零（原样取登记量，子样取创建时分得的量）；
 //   - 剩余量可以为零（分装用尽的旧约定），但不能为负；
-//   - 剩余量不能超过自身初始量。
+//   - 剩余量不能超过自身初始量；
+//   - 剩余量加上它直接分出的总量不得超过自身初始量。直接子样按各子样
+//     记录中的来源编号（ParentID）认定，每份只计其创建时取得的初始量，
+//     不能因为本样品的子样列表漏列就少算；子样后来继续分装、交接或销毁
+//     都不减少来源样品当时已经分出的量，孙样不计入祖父样，其他原样与
+//     兄弟子样也不参与。合计小于自身初始量仍可恢复（旧数据不要求强行
+//     补齐差额），恰好等于初始量是合法边界。
 //
 // 这一规则对登记的原样和分装产生的子样同样适用：子样的上限是它自己创建
 // 时取得的初始量，与其父样或其他样品的数量无关，不能借用父样的量。样品
-// 是否挂着待确认交接不影响本检查——即使交接量恰好等于错误的剩余量，数量
-// 越界也必须拒绝。任一不符都返回包装了 ErrInvalid 的错误，信息写明样品
-// 编号、违反的规则与初始量、剩余量，统一按三位小数毫升展示。
-func validateActiveQuantities(sampleID string, rec *sampleRecord) error {
+// 是否挂着待确认交接不影响本检查——即使交接量恰好等于剩余量，剩余量加
+// 直接分出总量越界也必须拒绝。任一不符都返回包装了 ErrInvalid 的错误，
+// 信息写明样品编号、违反的规则与初始量、剩余量和直接分出总量，统一按
+// 三位小数毫升展示；合计超出 int64 可表示范围时按无效数据拒绝，不能因
+// 数量过大把回绕后的差额当作合法结果接受。
+func validateActiveQuantities(sampleID string, rec *sampleRecord, l *ledger) error {
 	const msgTail = "，无法恢复"
 	switch {
 	case rec.Initial <= 0:
@@ -246,6 +257,40 @@ func validateActiveQuantities(sampleID string, rec *sampleRecord) error {
 	case rec.Remaining > rec.Initial:
 		return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升超过自身初始量 %s 毫升，剩余量不得大于初始量%s",
 			ErrInvalid, sampleID, formatUnits(rec.Remaining), formatUnits(rec.Initial), msgTail)
+	}
+
+	// 直接子样以各子样记录的来源编号为准，而不是本样品的 Children 列表：
+	// 列表漏列真正的直接子样时不能少算它创建时取得的量。子样后续分装、
+	// 交接、销毁都不改变来源样品当时已经分出的量，孙样不指向本样品，
+	// 自然不会被计入。
+	var directChildrenTotal int64
+	for otherID, other := range l.Samples {
+		if other == nil || other.ParentID != sampleID {
+			continue
+		}
+		if other.Initial <= 0 {
+			return fmt.Errorf("%w: 未销毁样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对剩余量与直接分出总量%s",
+				ErrInvalid, sampleID, otherID, formatUnits(other.Initial), msgTail)
+		}
+		next := directChildrenTotal + other.Initial
+		if next < 0 || next < directChildrenTotal {
+			return fmt.Errorf("%w: 未销毁样品 %q 的剩余量与直接分出总量合计超出可表示范围（直接子样 %q 初始量 %s 毫升）%s",
+				ErrInvalid, sampleID, otherID, formatUnits(other.Initial), msgTail)
+		}
+		directChildrenTotal = next
+	}
+
+	total := rec.Remaining + directChildrenTotal
+	if total < 0 || total < directChildrenTotal {
+		return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升与直接分出总量 %s 毫升合计超出可表示范围%s",
+			ErrInvalid, sampleID, formatUnits(rec.Remaining),
+			formatUnits(directChildrenTotal), msgTail)
+	}
+	if total > rec.Initial {
+		return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升加上直接子样创建时取得的总量 %s 毫升合计 %s 毫升，超过自身初始量 %s 毫升；剩余量与直接分出总量之和不得超过自身初始量%s",
+			ErrInvalid, sampleID,
+			formatUnits(rec.Remaining), formatUnits(directChildrenTotal),
+			formatUnits(total), formatUnits(rec.Initial), msgTail)
 	}
 	return nil
 }
