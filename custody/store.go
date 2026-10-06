@@ -445,6 +445,66 @@ func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) er
 	return nil
 }
 
+// checkDestroyConservation 在真正销毁前核对一份未销毁样品的数量是否恰好
+// 守恒：当前剩余量加上已经直接分出的总量，必须恰好等于该样品自身的初始量。
+//
+// 旧记录重新打开时允许“剩余量 + 直接分出总量 < 初始量”的缺口存在（见
+// validateActiveQuantities），这类记录可以继续打开和查询；但销毁会把剩余量
+// 归零并记下实际销毁量，恢复时要求销毁量与直接分出总量恰好等于初始量（见
+// validateDestroyedQuantity），若带着缺口销毁，落盘后的文件将再也无法打开。
+// 因此数量不守恒时必须在销毁前明确拒绝：不返回成功的样品结果、不记下销毁
+// 量，让样品保持未销毁，旧记录随后仍能重新打开并查询。绝不靠把缺口计入
+// 销毁量、补建子样或调整初始量来让销毁成功。
+//
+// 直接分出总量按子样记录的来源编号（ParentID）认定：全数据中任何来源编号
+// 指向本样品的子样都算直接子样，每份只计它创建时取得的初始量；子样后来
+// 继续分装、交接或销毁都不改变来源样品已经分出的量，孙样不重复计算，其他
+// 原样、兄弟子样和父样的数量也不参与。分装子样申请销毁时，按它自身创建时
+// 取得的初始量核对。没有直接子样时，剩余量必须恰好等于自身初始量，哪怕只
+// 缺 0.001 毫升也拒绝。任一不符都返回包装了 ErrConflict 的错误，信息写明
+// 样品编号，并以三位小数毫升列出自身初始量、当前剩余量、直接分出总量与
+// 缺口；合计超出 int64 可表示范围时同样按冲突拒绝，不能把回绕后的差额当作
+// 守恒结果。
+func checkDestroyConservation(sampleID string, rec *sampleRecord, l *ledger) error {
+	childIDs := make([]string, 0)
+	for otherID, other := range l.Samples {
+		if other != nil && other.ParentID == sampleID {
+			childIDs = append(childIDs, otherID)
+		}
+	}
+	sort.Strings(childIDs)
+
+	var directChildrenTotal int64
+	for _, childID := range childIDs {
+		next := directChildrenTotal + l.Samples[childID].Initial
+		if next < 0 || next < directChildrenTotal {
+			return fmt.Errorf("%w: 样品 %q 的剩余量 %s 毫升与直接分出总量合计超出可表示范围，不能销毁",
+				ErrConflict, sampleID, formatUnits(rec.Remaining))
+		}
+		directChildrenTotal = next
+	}
+	total := rec.Remaining + directChildrenTotal
+	if total < 0 || total < directChildrenTotal {
+		return fmt.Errorf("%w: 样品 %q 的剩余量 %s 毫升与直接分出总量 %s 毫升合计超出可表示范围，不能销毁",
+			ErrConflict, sampleID,
+			formatUnits(rec.Remaining), formatUnits(directChildrenTotal))
+	}
+	if total < rec.Initial {
+		gap := rec.Initial - total
+		return fmt.Errorf("%w: 样品 %q 数量有 %s 毫升的缺口，不能销毁：自身初始量 %s 毫升，当前剩余量 %s 毫升，直接分出总量 %s 毫升，剩余量与直接分出总量之和为 %s 毫升，小于自身初始量；销毁要求数量恰好守恒，旧记录仍可继续打开和查询，但不会把缺口计入销毁量",
+			ErrConflict, sampleID, formatUnits(gap),
+			formatUnits(rec.Initial), formatUnits(rec.Remaining),
+			formatUnits(directChildrenTotal), formatUnits(total))
+	}
+	if total > rec.Initial {
+		return fmt.Errorf("%w: 样品 %q 数量超出自身初始量，不能销毁：自身初始量 %s 毫升，当前剩余量 %s 毫升，直接分出总量 %s 毫升，剩余量与直接分出总量之和为 %s 毫升",
+			ErrConflict, sampleID,
+			formatUnits(rec.Initial), formatUnits(rec.Remaining),
+			formatUnits(directChildrenTotal), formatUnits(total))
+	}
+	return nil
+}
+
 // validatePendingContent 核对一条待确认交接的内容是否与样品当前记录一致。
 // 待确认交接表示样品当前全部剩余量尚待指定人员接收：样品必须未销毁且
 // 剩余量大于零，交接的交出人、交出地点和交接量必须分别精确等于样品的
@@ -1001,6 +1061,19 @@ type DestroyInput struct {
 // 持有人和地点保留为销毁前的最后记录，并在保管历史末尾追加一次销毁
 // 事件；返回该样品的最新查询结果。
 //
+// 销毁要求数量恰好守恒：样品当前剩余量加上已经直接分出的总量（按子样
+// 记录的来源编号认定，每份直接子样只计它创建时取得的初始量；子样后来
+// 继续分装、交接或销毁不改变来源样品已经分出的量，孙样不重复计算，其他
+// 原样、兄弟子样和父样不参与；分装子样按它自身创建时取得的初始量核对）
+// 必须恰好等于该样品自身的初始量，没有直接子样时剩余量必须等于自身
+// 初始量，哪怕只缺 0.001 毫升也拒绝。数量有缺口或超出时返回包装了
+// ErrConflict 的错误（不返回成功的样品结果），错误信息写明样品编号，
+// 并以三位小数毫升列出初始量、剩余量、直接分出总量与缺口；样品仍为
+// 未销毁，数量、持有人、地点、来源关系、子样列表、保管历史与文件内容
+// 全部保持原样，之后仍能重新打开并查询这份旧记录。这保留了“旧记录
+// 允许带缺口恢复与查询，但销毁必须守恒”的区别：不会把缺口计入销毁量，
+// 也不会补建子样或调整初始量来让销毁成功。
+//
 // 已销毁样品重复提交完全相同的操作人、地点、时间和原因时，返回原销毁
 // 结果且不再追加历史；文本按去首尾空白后的内容比较，时间按实际时刻
 // 比较。任一项不同则返回 ErrConflict，不覆盖原记录。
@@ -1065,6 +1138,13 @@ func (s *Store) Destroy(in DestroyInput) (*Sample, error) {
 			return nil, fmt.Errorf("%w: 销毁时间不能早于样品 %q 已有保管历史的时间 %s",
 				ErrInvalid, sampleID, h.Time.Format(time.RFC3339))
 		}
+	}
+	// 销毁会把剩余量归零并记下实际销毁量，恢复时要求销毁量与直接分出总量
+	// 恰好等于自身初始量；因此当前剩余量与已经直接分出的总量之和若不等于
+	// 自身初始量（旧记录允许存在缺口并继续打开），必须在销毁前拒绝，避免
+	// 销毁成功后文件反而无法再次打开。拒绝时状态与文件均保持原样。
+	if err := checkDestroyConservation(sampleID, rec, s.data); err != nil {
+		return nil, err
 	}
 
 	candidate := s.data.deepCopy()
