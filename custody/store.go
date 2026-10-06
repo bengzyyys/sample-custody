@@ -97,11 +97,13 @@ func Open(path string) (*Store, error) {
 //
 // 已确认交接属于保留的历史，不要求样品继续指向它，也不核对其与样品当前
 // 持有人、地点或剩余量的差异（样品后来分装、移动或销毁都不能否定当时的
-// 接收事实）；但它必须保留有效的接收信息：确认人非空且与该交接原先指定
-// 的接收人一致，接收时间存在且非零，且按实际时刻不早于交出时间（恰好
-// 相等合法，时区只影响表示）。集合中占用编号却为 null 的条目视为损坏，
-// 不能当作记录不存在。任一问题都使整个文件无法恢复，绝不只加载其中
-// 一部分，也不改动原文件。
+// 接收事实）；但它必须关联一份实际存在的样品记录，且交接量必须大于零、
+// 并不超过这份样品自身的初始量（原样取登记量，分装子样取它创建时分得的
+// 量，见 validateConfirmedTransfer）。此外它必须保留有效的接收信息：
+// 确认人非空且与该交接原先指定的接收人一致，接收时间存在且非零，且按
+// 实际时刻不早于交出时间（恰好相等合法，时区只影响表示）。集合中占用
+// 编号却为 null 的条目视为损坏，不能当作记录不存在。任一问题都使整个
+// 文件无法恢复，绝不只加载其中一部分，也不改动原文件。
 func validateRestored(l *ledger) error {
 	sampleIDs := make([]string, 0, len(l.Samples))
 	for id := range l.Samples {
@@ -160,7 +162,7 @@ func validateRestored(l *ledger) error {
 			return fmt.Errorf("%w: 交接编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
 		}
 		if rec.Confirmed {
-			if err := validateConfirmedReceipt(rec); err != nil {
+			if err := validateConfirmedTransfer(rec, l); err != nil {
 				return err
 			}
 			continue
@@ -343,6 +345,55 @@ func validatePendingContent(sampleID string, sample *sampleRecord, tr *transferR
 			ErrInvalid, sampleID, tr.ID, formatUnits(tr.Qty), formatUnits(sample.Remaining))
 	}
 	return nil
+}
+
+// validateConfirmedTransfer 核对一条已确认交接在恢复时必须同时满足的条件：
+//   - 必须关联一份实际存在的样品记录（样品编号缺失或记录为 null 都拒绝），
+//     不能让按交接编号查到的转手指向一份不存在的样品；
+//   - 交接量必须大于零：零量或负量不可能构成一次真实转手；
+//   - 交接量不得超过关联样品自身的初始量：原样的上限是登记量，分装子样
+//     的上限是它创建时分得的量，不能借用父样、兄弟子样或其他原样的量；
+//     交接量恰好等于样品自身初始量属于合法边界。
+//
+// 已确认交接保存的是当时发生的转手：样品后来分装、再次转交、更换持有人
+// 或地点、甚至被销毁，都不能否定它，因此不拿样品当前剩余量当上限，也不
+// 把同一样品多次转手的交接量相加。例如原样先以 10.000 完成交接、分出
+// 3.250 后再以剩余的 6.750 转交，两条旧交接都按各自当时的数量保留；
+// 初始量 3.250 的子样留下 4.000 的已确认交接，即使父样初始量为 10.000
+// 也必须拒绝。样品自身数量是否自洽由 validateActiveQuantities 与
+// validateDestroyedQuantity 另行核对，本函数不替代那部分检查。
+//
+// 数量与关联关系通过后，接收信息（确认人、接收时间）继续交由
+// validateConfirmedReceipt 核对。任一不符都返回包装了 ErrInvalid 的错误，
+// 信息写明交接编号、关联样品编号与具体原因；数量问题同时展示交接量与
+// 样品自身初始量，统一按三位小数毫升展示，绝不靠删除交接、补登记样品或
+// 调整数量来接受文件。
+func validateConfirmedTransfer(tr *transferRecord, l *ledger) error {
+	const msgTail = "，无法恢复"
+	sample, ok := l.Samples[tr.SampleID]
+	switch {
+	case !ok:
+		return fmt.Errorf("%w: 已确认交接 %q 关联的样品 %q 不存在%s",
+			ErrInvalid, tr.ID, tr.SampleID, msgTail)
+	case sample == nil:
+		return fmt.Errorf("%w: 已确认交接 %q 关联的样品 %q 记录为 null%s",
+			ErrInvalid, tr.ID, tr.SampleID, msgTail)
+	}
+	switch {
+	case tr.Qty <= 0:
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的交接量 %s 毫升必须大于零%s",
+			ErrInvalid, tr.ID, tr.SampleID, formatUnits(tr.Qty), msgTail)
+	case sample.Initial <= 0:
+		// 样品自身初始量不大于零时，样品数量检查本就会拒绝整份文件；这里
+		// 仍显式拦住，避免拿一个非法上限去比较交接量。
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）无法核对数量：样品自身初始量 %s 毫升必须大于零%s",
+			ErrInvalid, tr.ID, tr.SampleID, formatUnits(sample.Initial), msgTail)
+	case tr.Qty > sample.Initial:
+		return fmt.Errorf("%w: 已确认交接 %q（样品 %q）的交接量 %s 毫升超过样品自身初始量 %s 毫升，交接量不得大于该样品自身初始量%s",
+			ErrInvalid, tr.ID, tr.SampleID,
+			formatUnits(tr.Qty), formatUnits(sample.Initial), msgTail)
+	}
+	return validateConfirmedReceipt(tr)
 }
 
 // validateConfirmedReceipt 核对一条已确认交接是否保留了有效的接收事实。
