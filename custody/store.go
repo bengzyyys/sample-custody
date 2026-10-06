@@ -269,29 +269,14 @@ func validateActiveQuantities(sampleID string, rec *sampleRecord, l *ledger) err
 			ErrInvalid, sampleID, formatUnits(rec.Remaining), formatUnits(rec.Initial), msgTail)
 	}
 
-	// 直接分出总量以子样记录的来源编号为准：任何 ParentID 指向本样品的
-	// 现存子样都计入，即使本样品的子样列表没有列出它；只取子样创建时取得
-	// 的初始量。子样后续分装、交接、销毁与孙样都不影响这里的统计。
-	childIDs := make([]string, 0)
-	for otherID, other := range l.Samples {
-		if other != nil && other.ParentID == sampleID {
-			childIDs = append(childIDs, otherID)
-		}
-	}
-	sort.Strings(childIDs)
-	var directChildrenTotal int64
-	for _, childID := range childIDs {
-		childInitial := l.Samples[childID].Initial
-		if childInitial <= 0 {
-			return fmt.Errorf("%w: 未销毁样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对分出数量%s",
-				ErrInvalid, sampleID, childID, formatUnits(childInitial), msgTail)
-		}
-		next := directChildrenTotal + childInitial
-		if next < 0 || next < directChildrenTotal {
-			return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升与直接分出总量合计超出可表示范围%s",
-				ErrInvalid, sampleID, formatUnits(rec.Remaining), msgTail)
-		}
-		directChildrenTotal = next
+	// 直接分出总量的枚举、累计与拒绝规则只有一份实现（见
+	// sumDirectChildrenInitial）：打开未销毁数据、发起销毁、打开已销毁
+	// 数据三个场景共用，不再各自重复处理子样初始量不大于零与累计超出支持
+	// 范围。这里按“未销毁样品恢复失败”的语义把共同问题渲染为 ErrInvalid；
+	// 未销毁样品不做来源关系一致性核对，子样列表漏列不影响统计。
+	directChildrenTotal, prob := sumDirectChildrenInitial(l, sampleID)
+	if prob != nil {
+		return prob.asActiveRestoreError(sampleID, rec.Remaining)
 	}
 
 	total := rec.Remaining + directChildrenTotal
@@ -514,20 +499,12 @@ func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) er
 	}
 
 	// 只统计关系一致的直接子样创建时取得的初始量；子样后续变化与孙样都
-	// 不计入。
-	var directChildrenTotal int64
-	for _, childID := range rec.Children {
-		child := l.Samples[childID]
-		if child.Initial <= 0 {
-			return fmt.Errorf("%w: 样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对销毁数量%s",
-				ErrInvalid, sampleID, childID, formatUnits(child.Initial), msgTail)
-		}
-		next := directChildrenTotal + child.Initial
-		if next < 0 || next < directChildrenTotal {
-			return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，实际销毁量 %s 毫升与直接子样总量合计超出可表示范围%s",
-				ErrInvalid, sampleID, formatUnits(destroyedQty), msgTail)
-		}
-		directChildrenTotal = next
+	// 不计入。枚举、累计与拒绝规则由三个场景共用同一份实现（见
+	// sumDirectChildrenInitial），这里按“已销毁数据恢复失败”的语义把共同
+	// 问题渲染为 ErrInvalid。
+	directChildrenTotal, prob := sumDirectChildrenInitial(l, sampleID)
+	if prob != nil {
+		return prob.asDestroyedRestoreError(sampleID, destroyedQty)
 	}
 
 	total := destroyedQty + directChildrenTotal
@@ -545,12 +522,42 @@ func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) er
 	return nil
 }
 
-// directChildrenTotalBySource 按子样记录的来源编号（ParentID）统计全部直接
-// 子样创建时取得的初始量之和。子样后续继续分装、交接或销毁都不改变来源
-// 样品当时分出的量，因此只取 child.Initial，绝不改用其当前剩余量；孙样
-// （ParentID 指向其他样品）与同一份数据里的其他原样、兄弟子样、父样都不
-// 参与。任一直接子样初始量不大于零或累加溢出时返回错误。
-func directChildrenTotalBySource(l *ledger, sampleID string) (int64, error) {
+// directChildrenSumProblemKind 标识统计直接分出总量时共同规则发现的问题
+// 类型。枚举、累计与这两类拒绝规则只有一份实现（见
+// sumDirectChildrenInitial），由打开未销毁数据、发起销毁、打开已销毁数据
+// 三个场景共用；各场景再按自己的失败语义渲染成具体错误。
+type directChildrenSumProblemKind int
+
+const (
+	// childInitialNotPositive：某个直接子样创建时取得的初始量不大于零。
+	childInitialNotPositive directChildrenSumProblemKind = iota
+	// directChildrenSumOverflow：各直接子样初始量累加超出 int64 可表示范围。
+	directChildrenSumOverflow
+)
+
+// directChildrenSumProblem 描述统计直接分出总量时发现的一处共同问题，是
+// sumDirectChildrenInitial 的唯一失败结果形式。childID 与 childInitial 仅在
+// childInitialNotPositive 时使用，指出是哪份直接子样、它非法的初始量是多少。
+type directChildrenSumProblem struct {
+	kind         directChildrenSumProblemKind
+	childID      string
+	childInitial int64
+}
+
+// sumDirectChildrenInitial 按子样记录的来源编号（ParentID）统计全部直接
+// 子样创建时取得的初始量之和。这是“直接分出量”共同规则的唯一实现，三个
+// 使用场景都只维护这一份：
+//   - 只统计来源编号直接指向本样品的子样（按编号排序后逐份累计，保证错误
+//     指出的子样稳定）；每份只计入它创建时取得的初始量 child.Initial。
+//     子样后续继续分装、换持有人、换地点或独立销毁都不改变来源样品已经分
+//     出的量，因此绝不改用其当前剩余量；孙样（ParentID 指向其他样品）与
+//     同一份数据里的其他原样、兄弟子样、父样都不参与；
+//   - 子样列表是否漏列不影响本统计：只要来源编号指向本样品就计入，不要求
+//     调用方先通过来源关系一致性核对（未销毁样品恢复本就不做关系核对）；
+//   - 任一直接子样初始量不大于零、或各初始量累加超出 int64 支持范围时，
+//     返回对应的 directChildrenSumProblem，由调用方按场景渲染为原有分类与
+//     说明，绝不回绕成一个小数量继续核对。
+func sumDirectChildrenInitial(l *ledger, sampleID string) (int64, *directChildrenSumProblem) {
 	childIDs := make([]string, 0)
 	for otherID, other := range l.Samples {
 		if other != nil && other.ParentID == sampleID {
@@ -562,17 +569,67 @@ func directChildrenTotalBySource(l *ledger, sampleID string) (int64, error) {
 	for _, childID := range childIDs {
 		childInitial := l.Samples[childID].Initial
 		if childInitial <= 0 {
-			return 0, fmt.Errorf("%w: 样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对销毁数量",
-				ErrInvalid, sampleID, childID, formatUnits(childInitial))
+			return 0, &directChildrenSumProblem{
+				kind:         childInitialNotPositive,
+				childID:      childID,
+				childInitial: childInitial,
+			}
 		}
 		next := total + childInitial
 		if next < 0 || next < total {
-			return 0, fmt.Errorf("%w: 样品 %q 的剩余量与直接分出总量合计超出可表示范围，无法销毁",
-				ErrInvalid, sampleID)
+			return 0, &directChildrenSumProblem{kind: directChildrenSumOverflow}
 		}
 		total = next
 	}
 	return total, nil
+}
+
+// asActiveRestoreError 按“重新打开未销毁数据失败”的语义把统计问题渲染为
+// 包装了 ErrInvalid 的错误：信息写明未销毁样品编号，子样初始量非法时指出
+// 该直接子样编号与其初始量，数量统一按三位小数毫升展示，末尾带“，无法
+// 恢复”。措辞与历史可观察结果保持一致。
+func (p *directChildrenSumProblem) asActiveRestoreError(sampleID string, remaining int64) error {
+	const msgTail = "，无法恢复"
+	switch p.kind {
+	case childInitialNotPositive:
+		return fmt.Errorf("%w: 未销毁样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对分出数量%s",
+			ErrInvalid, sampleID, p.childID, formatUnits(p.childInitial), msgTail)
+	default: // directChildrenSumOverflow
+		return fmt.Errorf("%w: 未销毁样品 %q 的剩余量 %s 毫升与直接分出总量合计超出可表示范围%s",
+			ErrInvalid, sampleID, formatUnits(remaining), msgTail)
+	}
+}
+
+// asDestroyedRestoreError 按“重新打开已销毁数据失败”的语义把统计问题渲染
+// 为包装了 ErrInvalid 的错误：信息写明样品编号，子样初始量非法时指出该
+// 直接子样编号与其初始量，累加溢出时给出实际销毁量，数量统一按三位小数
+// 毫升展示，末尾带“，无法恢复”。措辞与历史可观察结果保持一致。
+func (p *directChildrenSumProblem) asDestroyedRestoreError(sampleID string, destroyedQty int64) error {
+	const msgTail = "，无法恢复"
+	switch p.kind {
+	case childInitialNotPositive:
+		return fmt.Errorf("%w: 样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对销毁数量%s",
+			ErrInvalid, sampleID, p.childID, formatUnits(p.childInitial), msgTail)
+	default: // directChildrenSumOverflow
+		return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，实际销毁量 %s 毫升与直接子样总量合计超出可表示范围%s",
+			ErrInvalid, sampleID, formatUnits(destroyedQty), msgTail)
+	}
+}
+
+// asDestroyCheckError 按“发起销毁前核对”的语义把统计问题渲染为错误。子样
+// 初始量非法与累加溢出沿用原分类，包装 ErrInvalid（数量本身不成立，而非
+// 状态冲突）；数量有缺口、来源关系矛盾等状态冲突仍由
+// validateDestroyConservation 与 checkDirectChildRelationship 各自按
+// ErrConflict 渲染。措辞与历史可观察结果保持一致。
+func (p *directChildrenSumProblem) asDestroyCheckError(sampleID string) error {
+	switch p.kind {
+	case childInitialNotPositive:
+		return fmt.Errorf("%w: 样品 %q 的直接子样 %q 初始量 %s 毫升必须大于零，无法核对销毁数量",
+			ErrInvalid, sampleID, p.childID, formatUnits(p.childInitial))
+	default: // directChildrenSumOverflow
+		return fmt.Errorf("%w: 样品 %q 的剩余量与直接分出总量合计超出可表示范围，无法销毁",
+			ErrInvalid, sampleID)
+	}
 }
 
 // validateDestroyConservation 是销毁前的数量守恒核对。销毁只能处理样品
@@ -589,9 +646,10 @@ func directChildrenTotalBySource(l *ledger, sampleID string) (int64, error) {
 // 旧样品只能继续作为未销毁记录保留，不能通过销毁“结清”。
 //
 // 直接分出总量按子样记录的来源编号认定、只计各直接子样创建时取得的初始
-// 量（见 directChildrenTotalBySource）：分装子样申请销毁时按它自身创建时
-// 取得的初始量核对，孙样不重复计算，其他原样、兄弟子样和父样都不参与；
-// 没有直接子样时，剩余量必须等于自身初始量，哪怕只缺 0.001 毫升也拒绝。
+// 量（共同统计规则见 sumDirectChildrenInitial）：分装子样申请销毁时按它
+// 自身创建时取得的初始量核对，孙样不重复计算，其他原样、兄弟子样和父样
+// 都不参与；没有直接子样时，剩余量必须等于自身初始量，哪怕只缺 0.001
+// 毫升也拒绝。
 // 子样列表与来源编号的关系还必须一致：关系规则只有一份实现（见
 // checkDirectChildRelationship），与重新打开已销毁记录时的恢复核对共用，
 // 这里按销毁冲突的语义渲染为 ErrConflict。公开操作维护的列表始终一致，
@@ -608,9 +666,13 @@ func validateDestroyConservation(sampleID string, rec *sampleRecord, l *ledger) 
 		return prob.asDestroyConflictError(sampleID)
 	}
 
-	directChildrenTotal, err := directChildrenTotalBySource(l, sampleID)
-	if err != nil {
-		return err
+	// 直接分出总量的枚举、累计与拒绝规则与另外两个场景共用同一份实现（见
+	// sumDirectChildrenInitial），这里按销毁前核对的语义渲染：子样初始量
+	// 非法、子样初始量累加溢出沿用原 ErrInvalid 分类；剩余量与之相加再溢出
+	// 或数量有缺口则属于状态冲突，按 ErrConflict 处理。
+	directChildrenTotal, prob := sumDirectChildrenInitial(l, sampleID)
+	if prob != nil {
+		return prob.asDestroyCheckError(sampleID)
 	}
 	total := rec.Remaining + directChildrenTotal
 	if total < 0 || total < directChildrenTotal {
