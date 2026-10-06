@@ -340,11 +340,118 @@ func validateDestroyedTime(sampleID string, rec *sampleRecord) error {
 	return nil
 }
 
+// childRelationKind 是直接子样关系核对发现的矛盾类别。
+type childRelationKind int
+
+const (
+	childDuplicate   childRelationKind = iota // 同一编号在子样列表中重复列入
+	childMissing                              // 列入的子样编号不存在（或记录为 null）
+	childNoSource                             // 列入的样品是没有来源编号的原样
+	childWrongSource                          // 列入的样品来源编号指向其他样品
+	childUnlisted                             // 来源编号指向本样品的子样未列入列表
+)
+
+// childRelationProblem 描述一次直接子样关系核对发现的矛盾。
+type childRelationProblem struct {
+	kind     childRelationKind
+	childID  string // 涉及矛盾的子样编号
+	sourceID string // 列入样品实际记录的来源编号（仅 childWrongSource 使用）
+}
+
+// checkDirectChildrenRelation 核对样品 sampleID 的直接子样关系是否一致，
+// 即“子样列表”与“子样记录中的来源编号”两个方向互相印证：
+//   - children 中每个编号只出现一次，且对应一份现存样品（null 记录视为不
+//     存在），该样品的来源编号正好指向 sampleID；
+//   - 反过来，全数据中任何来源编号指向 sampleID 的子样也都列在 children 中。
+//
+// 重复列入、列入不存在或来源不符的样品、漏列真正的直接子样都属于关系矛盾，
+// 即使数量合计碰巧等于初始量也不能接受。原样和分装子样遵守同一项规则：
+// 分装子样核对的是自己直接分出的子样，父样、兄弟子样和其他原样都不参与。
+// 核对顺序为先按列表顺序核对列入项，再反向核对漏列；发现矛盾时返回第一个
+// 问题，完全一致时返回 nil。本函数只读取记录，绝不通过去重、补列或修改
+// 来源编号来“修复”数据；如何报告矛盾（ErrInvalid 还是 ErrConflict、信息
+// 措辞）由调用方按使用条件决定。
+func checkDirectChildrenRelation(l *ledger, sampleID string, children []string) *childRelationProblem {
+	listed := make(map[string]struct{}, len(children))
+	for _, childID := range children {
+		if _, dup := listed[childID]; dup {
+			return &childRelationProblem{kind: childDuplicate, childID: childID}
+		}
+		listed[childID] = struct{}{}
+		child, ok := l.Samples[childID]
+		if !ok || child == nil {
+			return &childRelationProblem{kind: childMissing, childID: childID}
+		}
+		if child.ParentID != sampleID {
+			if child.ParentID == "" {
+				return &childRelationProblem{kind: childNoSource, childID: childID}
+			}
+			return &childRelationProblem{kind: childWrongSource, childID: childID, sourceID: child.ParentID}
+		}
+	}
+	// 反向核对：任何真正由本样品分出的子样都必须列在子样列表中，漏列会
+	// 让查询出的来源关系互相矛盾，不能因数量等式成立而接受。
+	for otherID, other := range l.Samples {
+		if other == nil || other.ParentID != sampleID {
+			continue
+		}
+		if _, ok := listed[otherID]; !ok {
+			return &childRelationProblem{kind: childUnlisted, childID: otherID}
+		}
+	}
+	return nil
+}
+
+// destroyedRelationError 把直接子样关系矛盾报告为恢复已销毁记录时的
+// ErrInvalid 错误，信息写明样品编号、涉及的子样与具体原因。
+func destroyedRelationError(sampleID string, p *childRelationProblem) error {
+	switch p.kind {
+	case childDuplicate:
+		return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，直接子样编号 %q 在子样列表中重复列入，同一子样只能计入一次，无法恢复",
+			ErrInvalid, sampleID, p.childID)
+	case childMissing:
+		return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，列入的直接子样 %q 不存在，无法恢复",
+			ErrInvalid, sampleID, p.childID)
+	case childNoSource:
+		return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，列入的子样 %q 是原样、没有来源编号，不是由样品 %q 直接分出的子样，无法恢复",
+			ErrInvalid, sampleID, p.childID, sampleID)
+	case childWrongSource:
+		return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，列入的子样 %q 来源编号为 %q，不是由样品 %q 直接分出的子样，无法恢复",
+			ErrInvalid, sampleID, p.childID, p.sourceID, sampleID)
+	default: // childUnlisted
+		return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，子样 %q 的来源编号指向样品 %q，却没有列在样品 %q 的直接子样列表中，属于漏列，无法恢复",
+			ErrInvalid, sampleID, p.childID, sampleID, sampleID)
+	}
+}
+
+// destroyRelationConflict 把直接子样关系矛盾报告为发起销毁时的
+// ErrConflict 错误，信息写明样品编号、涉及的子样与具体原因。
+func destroyRelationConflict(sampleID string, p *childRelationProblem) error {
+	switch p.kind {
+	case childDuplicate:
+		return fmt.Errorf("%w: 样品 %q 数量来源关系自相矛盾，不能销毁：直接子样编号 %q 在子样列表中重复列入；记录保持原样，请先核对子样列表",
+			ErrConflict, sampleID, p.childID)
+	case childMissing:
+		return fmt.Errorf("%w: 样品 %q 数量来源关系自相矛盾，不能销毁：子样列表中的直接子样 %q 不存在；记录保持原样，请先核对子样列表",
+			ErrConflict, sampleID, p.childID)
+	case childNoSource:
+		return fmt.Errorf("%w: 样品 %q 数量来源关系自相矛盾，不能销毁：列入的子样 %q 是没有来源编号的原样，不是由样品 %q 直接分出的子样；记录保持原样，请先核对子样列表",
+			ErrConflict, sampleID, p.childID, sampleID)
+	case childWrongSource:
+		return fmt.Errorf("%w: 样品 %q 数量来源关系自相矛盾，不能销毁：列入的子样 %q 来源编号为 %q，不是由样品 %q 直接分出的子样；记录保持原样，请先核对子样列表",
+			ErrConflict, sampleID, p.childID, p.sourceID, sampleID)
+	default: // childUnlisted
+		return fmt.Errorf("%w: 样品 %q 数量来源关系自相矛盾，不能销毁：子样 %q 的来源编号指向样品 %q，却没有列在它的直接子样列表中；记录保持原样，请先核对子样列表",
+			ErrConflict, sampleID, p.childID, sampleID)
+	}
+}
+
 // validateDestroyedQuantity 核对一份带销毁信息的样品记录其数量是否守恒。
 // 销毁处理的是样品当时的全部剩余量，因此恢复时必须满足：
 //   - 当前剩余量为 0.000；
 //   - 自身初始量与实际销毁量都大于零（参与核对的数量必须为正）；
-//   - 参与数量核对的子样关系必须一致：Children 里每个编号都对应一份现存
+//   - 参与数量核对的子样关系必须一致（与发起销毁时共用同一项关系规则，
+//     见 checkDirectChildrenRelation）：Children 里每个编号都对应一份现存
 //     样品，且该子样的 ParentID 正好指向本样品，每个编号在列表中只出现
 //     一次；反过来，全数据中任何 ParentID 指向本样品的子样也必须列在
 //     Children 里。同一编号重复列入、列入的子样来源不符（含来源为空或
@@ -378,39 +485,11 @@ func validateDestroyedQuantity(sampleID string, rec *sampleRecord, l *ledger) er
 			ErrInvalid, sampleID, formatUnits(destroyedQty), msgTail)
 	}
 
-	// 先确认参与数量核对的子样集合关系一致，再统计它们创建时取得的初始
+	// 先确认参与数量核对的子样集合关系一致（与发起销毁时共用同一项关系
+	// 规则，见 checkDirectChildrenRelation），再统计它们创建时取得的初始
 	// 量：数量等式成立也不能掩盖重复列入、来源不符或漏列。
-	listed := make(map[string]struct{}, len(rec.Children))
-	for _, childID := range rec.Children {
-		if _, dup := listed[childID]; dup {
-			return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，直接子样编号 %q 在子样列表中重复列入，同一子样只能计入一次%s",
-				ErrInvalid, sampleID, childID, msgTail)
-		}
-		listed[childID] = struct{}{}
-		child, ok := l.Samples[childID]
-		if !ok || child == nil {
-			return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，列入的直接子样 %q 不存在%s",
-				ErrInvalid, sampleID, childID, msgTail)
-		}
-		if child.ParentID != sampleID {
-			if child.ParentID == "" {
-				return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，列入的子样 %q 是原样、没有来源编号，不是由样品 %q 直接分出的子样%s",
-					ErrInvalid, sampleID, childID, sampleID, msgTail)
-			}
-			return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，列入的子样 %q 来源编号为 %q，不是由样品 %q 直接分出的子样%s",
-				ErrInvalid, sampleID, childID, child.ParentID, sampleID, msgTail)
-		}
-	}
-	// 反向核对：任何真正由本样品分出的子样都必须列在子样列表中，漏列会
-	// 让查询出的来源关系互相矛盾，不能因数量等式成立而接受。
-	for otherID, other := range l.Samples {
-		if other == nil || other.ParentID != sampleID {
-			continue
-		}
-		if _, ok := listed[otherID]; !ok {
-			return fmt.Errorf("%w: 样品 %q 的销毁数量核对中，子样 %q 的来源编号指向样品 %q，却没有列在样品 %q 的直接子样列表中，属于漏列%s",
-				ErrInvalid, sampleID, otherID, sampleID, sampleID, msgTail)
-		}
+	if p := checkDirectChildrenRelation(l, sampleID, rec.Children); p != nil {
+		return destroyedRelationError(sampleID, p)
 	}
 
 	// 只统计关系一致的直接子样创建时取得的初始量；子样后续变化与孙样都
@@ -493,44 +572,19 @@ func directChildrenTotalBySource(l *ledger, sampleID string) (int64, error) {
 // 取得的初始量核对，孙样不重复计算，其他原样、兄弟子样和父样都不参与；
 // 没有直接子样时，剩余量必须等于自身初始量，哪怕只缺 0.001 毫升也拒绝。
 // 子样列表与来源编号的关系还必须一致（不重复列入、列入的子样现存且来源
-// 指向本样品、真正的直接子样不漏列）：公开操作维护的列表始终一致，但旧
+// 指向本样品、真正的直接子样不漏列；与恢复已销毁记录时共用同一项关系
+// 规则，见 checkDirectChildrenRelation）：公开操作维护的列表始终一致，但旧
 // 文件可能带着互相矛盾的列表，放行会让销毁后的文件在重新打开时因来源
 // 关系不符而失败，因此同样拒绝，且不替记录增删或改写子样。调用方已保证
 // 样品未销毁、仍有正剩余量且没有待确认交接。任一不符都返回包装了
 // ErrConflict 的错误；数量有缺口时信息写明样品编号以及三位小数毫升的
 // 初始量、剩余量、直接分出总量和缺口。
 func validateDestroyConservation(sampleID string, rec *sampleRecord, l *ledger) error {
-	// 先核对子样列表与来源编号的关系一致，再统计直接分出总量，保证销毁
-	// 落盘后的记录能通过重新打开时的来源关系与数量守恒核对。
-	listed := make(map[string]struct{}, len(rec.Children))
-	for _, childID := range rec.Children {
-		if _, dup := listed[childID]; dup {
-			return fmt.Errorf("%w: 样品 %q 数量来源关系自相矛盾，不能销毁：直接子样编号 %q 在子样列表中重复列入；记录保持原样，请先核对子样列表",
-				ErrConflict, sampleID, childID)
-		}
-		listed[childID] = struct{}{}
-		child, ok := l.Samples[childID]
-		if !ok || child == nil {
-			return fmt.Errorf("%w: 样品 %q 数量来源关系自相矛盾，不能销毁：子样列表中的直接子样 %q 不存在；记录保持原样，请先核对子样列表",
-				ErrConflict, sampleID, childID)
-		}
-		if child.ParentID != sampleID {
-			if child.ParentID == "" {
-				return fmt.Errorf("%w: 样品 %q 数量来源关系自相矛盾，不能销毁：列入的子样 %q 是没有来源编号的原样，不是由样品 %q 直接分出的子样；记录保持原样，请先核对子样列表",
-					ErrConflict, sampleID, childID, sampleID)
-			}
-			return fmt.Errorf("%w: 样品 %q 数量来源关系自相矛盾，不能销毁：列入的子样 %q 来源编号为 %q，不是由样品 %q 直接分出的子样；记录保持原样，请先核对子样列表",
-				ErrConflict, sampleID, childID, child.ParentID, sampleID)
-		}
-	}
-	for otherID, other := range l.Samples {
-		if other == nil || other.ParentID != sampleID {
-			continue
-		}
-		if _, ok := listed[otherID]; !ok {
-			return fmt.Errorf("%w: 样品 %q 数量来源关系自相矛盾，不能销毁：子样 %q 的来源编号指向样品 %q，却没有列在它的直接子样列表中；记录保持原样，请先核对子样列表",
-				ErrConflict, sampleID, otherID, sampleID)
-		}
+	// 先核对子样列表与来源编号的关系一致（与恢复已销毁记录时共用同一项
+	// 关系规则，见 checkDirectChildrenRelation），再统计直接分出总量，保证
+	// 销毁落盘后的记录能通过重新打开时的来源关系与数量守恒核对。
+	if p := checkDirectChildrenRelation(l, sampleID, rec.Children); p != nil {
+		return destroyRelationConflict(sampleID, p)
 	}
 
 	directChildrenTotal, err := directChildrenTotalBySource(l, sampleID)
