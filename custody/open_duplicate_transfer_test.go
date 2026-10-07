@@ -124,6 +124,159 @@ func TestOpenDuplicateTransferFailsWholeFile(t *testing.T) {
 	mustRejectOpen(t, path, "TR-001", "出现多次")
 }
 
+// TestOpenRejectsDuplicateAcrossTwoTransfersFields 覆盖本缺陷的核心形态：
+// 文件顶层有两个同名 transfers 字段，TR-001 分别在两个字段里各保存一次
+// （前一个是已确认接收，后一个是待确认）。标准库解码重复字段时只保留
+// 最后一个字段的整张表，唯一性判断必须覆盖整份文件里的全部交接集合：
+// 只要该编号再次作为任一字段中的键出现，就拒绝整份数据，不能让后出现的
+// 记录静默覆盖先前的接收事实。
+func TestOpenRejectsDuplicateAcrossTwoTransfersFields(t *testing.T) {
+	second := `"id":"TR-001","sampleId":"S1","fromHolder":"张三","fromLocation":"A","toHolder":"赵六","toLocation":"D","qty":10000,"handedOverAt":"2026-10-04T10:00:00Z","confirmed":false`
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "samples": {`+rawSampleS1TwoHandovers+`},
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  },
+  "transfers": {
+    "TR-001": {`+second+`}
+  }
+}`)
+	mustRejectOpen(t, path, "TR-001", "出现多次")
+}
+
+// TestOpenRejectsDuplicateAcrossFieldsSeparatedByTopLevelFields 两个同名
+// transfers 字段之间隔着其他顶层字段、第二个字段内还隔着其他编号的交接，
+// 重复编号同样不能漏过。
+func TestOpenRejectsDuplicateAcrossFieldsSeparatedByTopLevelFields(t *testing.T) {
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  },
+  "samples": {`+rawSampleS1TwoHandovers+`},
+  "note": {"text": "两个交接集合之间隔着其他顶层字段"},
+  "transfers": {
+    "TR-002": {`+rawTR002Confirmed+`},
+    "TR-001": {`+rawTR001Confirmed+`}
+  }
+}`)
+	mustRejectOpen(t, path, "TR-001", "出现多次")
+}
+
+// TestOpenRejectsIdenticalDuplicateAcrossTwoFields 两个字段里的 TR-001
+// 内容完全相同、确认状态相同也必须拒绝：不能按内容是否一致挑选其中一条。
+func TestOpenRejectsIdenticalDuplicateAcrossTwoFields(t *testing.T) {
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "samples": {`+rawSampleS1TwoHandovers+`},
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  },
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  }
+}`)
+	mustRejectOpen(t, path, "TR-001", "出现多次")
+}
+
+// TestOpenRejectsDuplicateAcrossFieldsViaUnicodeEscape 分处两个字段的编号
+// 经 JSON 解码后是同一文字（其中一个首字符写成 U+0054 转义）时仍算重复。
+func TestOpenRejectsDuplicateAcrossFieldsViaUnicodeEscape(t *testing.T) {
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "samples": {`+rawSampleS1TwoHandovers+`},
+  "transfers": {
+    `+escapedTR001+`: {`+rawTR001Confirmed+`}
+  },
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  }
+}`)
+	mustRejectOpen(t, path, "TR-001", "出现多次")
+}
+
+// TestOpenDuplicateAcrossFieldsFailsWholeFile 跨字段重复时，即使文件里还
+// 有完全正常的样品，也不能只载入正常部分：整份打开失败、原文件保持原样。
+func TestOpenDuplicateAcrossFieldsFailsWholeFile(t *testing.T) {
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "samples": {
+    "OK": {"id":"OK","initial":100,"remaining":100,"holder":"h","location":"l","children":[],"history":[]},
+    "S1": {"id":"S1","initial":10000,"remaining":6750,"holder":"王五","location":"C","children":[],"history":[]}
+  },
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  },
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  }
+}`)
+	mustRejectOpen(t, path, "TR-001", "出现多次")
+}
+
+// TestOpenMergesDistinctIDsAcrossDuplicateTransfersFields 多个同名 transfers
+// 字段分别只含不同编号时，不应仅因字段重名就报编号冲突：各条记录合并恢复，
+// 仍能按编号查询到各自的确认信息，样品多次转手的现状也正常恢复。
+func TestOpenMergesDistinctIDsAcrossDuplicateTransfersFields(t *testing.T) {
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "samples": {`+rawSampleS1TwoHandovers+`},
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  },
+  "transfers": {
+    "TR-002": {`+rawTR002Confirmed+`}
+  }
+}`)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("字段重名但编号互不相同应正常打开: %v", err)
+	}
+	for _, id := range []string{"TR-001", "TR-002"} {
+		tr, err := s.GetTransfer(id)
+		if err != nil {
+			t.Fatalf("交接 %s 应跨字段合并恢复并可查询: %v", id, err)
+		}
+		if !tr.Confirmed {
+			t.Fatalf("交接 %s 应为已确认记录: %+v", id, tr)
+		}
+	}
+	if len(s.data.Transfers) != 2 {
+		t.Fatalf("两个字段中的不同编号都应保留, got %d 条", len(s.data.Transfers))
+	}
+	p, err := s.GetSample("S1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Remaining != "6.750" || p.Holder != "王五" || p.Location != "C" {
+		t.Fatalf("同一样品不同编号的两次转手应各自保留: %+v", p)
+	}
+}
+
+// TestOpenMergesDistinctIDsAcrossFieldsWithNullBetween 后一个 transfers
+// 字段为 null 不应清空前一个字段已经保存的交接；中间插入的其他顶层字段
+// 也不影响合并恢复。
+func TestOpenMergesDistinctIDsAcrossFieldsWithNullBetween(t *testing.T) {
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "samples": {`+rawSampleS1TwoHandovers+`},
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`},
+    "TR-002": {`+rawTR002Confirmed+`}
+  },
+  "note": "中间字段",
+  "transfers": null
+}`)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("后一个 transfers 为 null 不应影响前一个字段的记录: %v", err)
+	}
+	if len(s.data.Transfers) != 2 {
+		t.Fatalf("前一个字段的两条交接都应保留, got %d 条", len(s.data.Transfers))
+	}
+}
+
 // TestOpenDoesNotMentionTransferIDInTextAsDuplicate 编号文字只出现在保管
 // 历史说明或交接记录字段值（含 Unicode 转义写法、含未知字段）中，而键
 // 各自不同，不能误报为重复。同一样品的两次转手按现有规则正常恢复。
