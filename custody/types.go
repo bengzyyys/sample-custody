@@ -163,17 +163,19 @@ func newLedger() *ledger {
 }
 
 // UnmarshalJSON 按现有格式解码一份本地样品数据，并在交接集合上额外保证
-// 交接编号唯一。transfers 是一个 JSON 对象，标准库把它解码进 map 时，
-// 同一键出现多次会静默用后一条覆盖前一条——仅靠解码后的 map 无法再发现
-// 这种重复，原先的接收事实或待确认信息可能因此丢失。因此解码前后各做
-// 一次：
+// 交接编号在整份数据中唯一。transfers 是一个 JSON 对象，标准库把它解码进
+// map 时，同一键出现多次会静默用后一条覆盖前一条；顶层若写了多个同名
+// transfers 字段，标准库又只保留最后一个字段的内容——仅靠解码后的 map
+// 无法再发现这两类重复，原先的接收事实或待确认信息可能因此丢失。因此
+// 解码前后各做一次：
 //   - 先按现有格式正常解码，缺省、null 或空对象的集合保持原有含义；
-//   - 再在原始 JSON 上做一次 token 级扫描（见 duplicateJSONKeys），只统计
-//     transfers 对象自身的键：一旦同一编号（按 JSON 解码后实际表示的文字
-//     比较，合法 Unicode 转义与直接写出同一文字视为同一编号）出现多次，
-//     无论两条记录相邻还是隔着其他交接、内容是否相同、确认状态如何，都
-//     返回包装了 ErrInvalid 的错误，并写明重复的交接编号以及“同一编号
-//     出现多次”的原因。
+//   - 再在原始 JSON 上做一次 token 级扫描（见 duplicateJSONKeys），统计
+//     顶层全部 transfers 对象的键：一旦同一编号（按 JSON 解码后实际表示的
+//     文字比较，合法 Unicode 转义与直接写出同一文字视为同一编号）在整份
+//     数据的所有交接集合里合计出现多次，无论两条记录在同一集合内还是分属
+//     两个同名 transfers 字段、相邻还是隔着其他交接或其他顶层字段、内容
+//     是否相同、确认状态如何，都返回包装了 ErrInvalid 的错误，并写明重复
+//     的交接编号以及“同一编号出现多次”的原因。
 //
 // 扫描只读取 transfers 对象的键，其值作为整体跳过，因此样品保管历史的
 // 说明、交接记录字段值或其他说明文字中再次提到某编号不会被当作重复键。
@@ -189,18 +191,21 @@ func (l *ledger) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	if dup != "" {
-		return fmt.Errorf("%w: 交接编号 %q 在交接集合中出现多次，同一交接编号只能对应一条交接记录；重复编号无法确定应保留哪一条接收事实或待确认信息，无法恢复",
+		return fmt.Errorf("%w: 交接编号 %q 在整份数据的交接集合中出现多次，同一交接编号只能对应一条交接记录；重复编号无法确定应保留哪一条接收事实或待确认信息，无法恢复",
 			ErrInvalid, dup)
 	}
 	return nil
 }
 
-// duplicateJSONKeys 扫描一段对象 JSON，返回其中指定名字段（field）对应
-// 对象里重复出现的键。字段缺省、为 null 或为空对象时不存在重复，返回
-// 空字符串。比较基于 JSON 解码后实际表示的文字：Decoder.Token 返回的
+// duplicateJSONKeys 扫描一段对象 JSON，返回顶层指定名字段（field）对应
+// 的全部对象里重复出现的键。字段缺省、为 null 或为空对象时不存在重复，
+// 返回空字符串。比较基于 JSON 解码后实际表示的文字：Decoder.Token 返回的
 // 字符串键已完成 Unicode 反转义，所以 "TR-001" 与 "TR-001" 这类
 // 合法转义表示同一文字时会被判为同一键。
 //
+// 顶层同名字段可能出现多次（例如两个 transfers 字段），此时所有同名对象
+// 共用同一份已见集合：同一编号分属两个同名字段同样判为重复，不能被标准库
+// “只保留最后一个字段”的解码语义绕过；同名字段各自只含不同编号时不算重复。
 // 扫描只在目标对象内统计“键”，对象与数组的值都按括号配对整体跳过，
 // 不读取其中任何字符串内容——因此写在字段值、保管历史说明等位置的编号
 // 文本不会被当作键统计。顶层其他字段的内容同样整体跳过。返回的重复键
@@ -215,6 +220,9 @@ func duplicateJSONKeys(raw []byte, field string) (string, error) {
 		return "", fmt.Errorf("期望顶层为 JSON 对象")
 	}
 
+	// 顶层全部同名 transfers 对象共用同一份已见集合：同一编号无论出现在
+	// 同一对象内还是分属多个同名字段，合计出现多次即判为重复。
+	seen := make(map[string]struct{})
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
@@ -228,7 +236,8 @@ func duplicateJSONKeys(raw []byte, field string) (string, error) {
 			continue
 		}
 		// 找到目标字段：先取其起始 token，判断是否为对象。顶层出现多个
-		// 同名字段时逐一检查，避免被标准库“取最后一个”的语义绕过判重。
+		// 同名字段时逐一检查并累计进同一 seen，避免被标准库“取最后一个”
+		// 的语义绕过判重。
 		start, err := dec.Token()
 		if err != nil {
 			return "", err
@@ -238,7 +247,6 @@ func duplicateJSONKeys(raw []byte, field string) (string, error) {
 			// null、标量或数组都不是对象，且该值已随上面的 Token 消费完毕。
 			continue
 		}
-		seen := make(map[string]struct{})
 		for dec.More() {
 			kt, err := dec.Token()
 			if err != nil {

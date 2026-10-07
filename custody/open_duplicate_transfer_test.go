@@ -210,3 +210,94 @@ func TestOpenDuplicateTransferErrorIsInvalid(t *testing.T) {
 		t.Fatalf("重复交接编号不应归类为 ErrConflict: %v", err)
 	}
 }
+
+// TestOpenRejectsDuplicateTransferIDAcrossRepeatedFields 覆盖顶层同名字段的
+// 形态：两个 transfers 字段各自只写一条 TR-001，标准库解码时后一个字段的
+// 内容并入同一 map、同一编号被静默覆盖。唯一性判断必须覆盖整份文件的所有
+// 交接集合，只要该编号再次作为交接集合中的键出现就拒绝整份数据。
+func TestOpenRejectsDuplicateTransferIDAcrossRepeatedFields(t *testing.T) {
+	second := `"id":"TR-001","sampleId":"S1","fromHolder":"张三","fromLocation":"A","toHolder":"赵六","toLocation":"D","qty":10000,"handedOverAt":"2026-10-04T10:00:00Z","confirmed":false`
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "samples": {`+rawSampleS1TwoHandovers+`},
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  },
+  "transfers": {
+    "TR-001": {`+second+`}
+  }
+}`)
+	mustRejectOpen(t, path, "TR-001", "出现多次")
+}
+
+// TestOpenRejectsDuplicateTransferIDAcrossFieldsSeparatedByOthers 两个同名
+// transfers 字段之间隔着其他顶层字段、两条重复记录之间还隔着其他编号的
+// 交接，同样不能漏过。
+func TestOpenRejectsDuplicateTransferIDAcrossFieldsSeparatedByOthers(t *testing.T) {
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  },
+  "samples": {`+rawSampleS1TwoHandovers+`},
+  "note": "说明文字提到 TR-001 不算再次保存",
+  "transfers": {
+    "TR-002": {`+rawTR002Confirmed+`},
+    "TR-001": {`+rawTR001Confirmed+`}
+  }
+}`)
+	mustRejectOpen(t, path, "TR-001", "出现多次")
+}
+
+// TestOpenRejectsDuplicateTransferIDAcrossFieldsViaUnicodeEscape 跨同名字段
+// 的判重同样按 JSON 解码后的文字比较：后一个 transfers 字段把 TR-001 的
+// 首字符写成合法 Unicode 转义，仍与前一字段直接写出的编号算同一个。
+func TestOpenRejectsDuplicateTransferIDAcrossFieldsViaUnicodeEscape(t *testing.T) {
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "samples": {`+rawSampleS1TwoHandovers+`},
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  },
+  "transfers": {
+    `+escapedTR001+`: {`+rawTR001Confirmed+`}
+  }
+}`)
+	mustRejectOpen(t, path, "TR-001", "出现多次")
+}
+
+// TestOpenRepeatedTransfersFieldsWithDistinctIDs 多个同名 transfers 字段
+// 分别只含不同编号时，不应仅因字段重复就报交接编号冲突：整份文件正常
+// 打开，各条记录都能按编号查询，确认信息各自保留。
+func TestOpenRepeatedTransfersFieldsWithDistinctIDs(t *testing.T) {
+	path := writeRawLedger(t, `{
+  "version": 1,
+  "samples": {`+rawSampleS1TwoHandovers+`},
+  "transfers": {
+    "TR-001": {`+rawTR001Confirmed+`}
+  },
+  "transfers": {
+    "TR-002": {`+rawTR002Confirmed+`}
+  }
+}`)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("同名 transfers 字段各含不同编号不应判为冲突: %v", err)
+	}
+	for _, id := range []string{"TR-001", "TR-002"} {
+		tr, err := s.GetTransfer(id)
+		if err != nil {
+			t.Fatalf("交接 %s 应按编号查询到: %v", id, err)
+		}
+		if !tr.Confirmed {
+			t.Fatalf("交接 %s 的确认信息应保留: %+v", id, tr)
+		}
+	}
+	p, err := s.GetSample("S1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Remaining != "6.750" || p.Holder != "王五" || p.Location != "C" {
+		t.Fatalf("样品多次转手后的当前状态应正常恢复: %+v", p)
+	}
+}
