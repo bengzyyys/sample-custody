@@ -1,6 +1,7 @@
 package custody
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -28,6 +29,10 @@ type Store struct {
 
 // Open 打开 path 指向的本地样品数据：文件不存在时创建一份新数据，
 // 已存在时原样重新打开，历史记录与交接编号判断继续有效。
+//
+// 交接集合中每个交接编号只能出现一次：同一编号写了两条（无论是否相邻、
+// 内容是否相同）都使整份文件打开失败，返回包装了 ErrInvalid 的错误，
+// 原文件内容保持原样，绝不只加载其中正常部分。
 func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("%w: 数据文件路径不能为空", ErrInvalid)
@@ -64,6 +69,78 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("打开本地样品数据 %s 失败: %w", path, err)
 	}
 	return s, nil
+}
+
+// UnmarshalJSON 恢复整份状态。交接集合不能直接用 map 解码：JSON 对象里
+// 同一编号写两条时，普通解码会让后一条悄悄覆盖前一条，原先的接收事实或
+// 待确认信息就此丢失。这里改为逐键解码（见 decodeTransfers），同一交接
+// 编号出现两次即拒绝整份数据。
+func (l *ledger) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Version   int                      `json:"version"`
+		Samples   map[string]*sampleRecord `json:"samples"`
+		Transfers json.RawMessage          `json:"transfers"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	transfers, err := decodeTransfers(raw.Transfers)
+	if err != nil {
+		return err
+	}
+	l.Version = raw.Version
+	l.Samples = raw.Samples
+	l.Transfers = transfers
+	return nil
+}
+
+// decodeTransfers 解码交接集合，并保证交接编号在读取已有数据时同样唯一：
+//   - 集合缺省或为 null 时返回 nil，由调用方按既有约定替换为空集合；
+//     空对象返回空集合，含义均不变；
+//   - 为对象时逐个键解码，键按 JSON 解码后实际表示的文字比较（合法
+//     Unicode 转义写法与字面写法表示同一编号），同一编号第二次出现即
+//     返回包装了 ErrInvalid 的错误，写明重复的交接编号与同一编号只能
+//     出现一次的原因。无论两条记录内容是否相同、是否相邻，也绝不按
+//     确认状态或关联样品选择其中一条、删除或合并条目、自动改号来接受；
+//   - 只在交接集合的键上判断唯一性：样品保管历史的说明、交接记录的
+//     字段值或其他说明文字中再次提到某个编号不算重复；不同编号的交接
+//     关联同一份样品（样品的多次转手）也属正常，不在此拒绝。
+func decodeTransfers(raw json.RawMessage) (map[string]*transferRecord, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, fmt.Errorf("交接集合必须是 JSON 对象或 null")
+	}
+	transfers := make(map[string]*transferRecord)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		id, ok := keyTok.(string)
+		if !ok {
+			return nil, fmt.Errorf("交接集合的键必须是字符串")
+		}
+		if _, dup := transfers[id]; dup {
+			return nil, fmt.Errorf("%w: 交接编号 %q 在交接集合中重复出现，同一交接编号只能出现一次，无法恢复",
+				ErrInvalid, id)
+		}
+		var rec *transferRecord
+		if err := dec.Decode(&rec); err != nil {
+			return nil, err
+		}
+		transfers[id] = rec
+	}
+	if _, err := dec.Token(); err != nil { // 闭合的 '}'
+		return nil, err
+	}
+	return transfers, nil
 }
 
 // validateRestored 校验从文件恢复的数据中每份样品自身的数量、待确认交接
