@@ -103,6 +103,14 @@ func Open(path string) (*Store, error) {
 // 操作人或地点缺失、为空或只有空白同样无效，不能因样品对应字段也为空而
 // 当作一致；已保存的非空文本按原文核对，不通过去掉空白来接受不同内容。
 //
+// 每条交接（待确认与已确认都一样）在交接集合中的编号与记录自身保存的编号
+// 还必须是同一个非空编号，且两处都符合交接编号去首尾空白后保存的约定（见
+// validateTransferIDConsistency）：缺少记录自身编号、编号为空或只有空白、
+// 保存的编号含有首尾空白、两处编号文字不同都按无效数据拒绝，不能通过补填
+// 编号、去掉空白、挪到另一个编号下或挑选其中一处来接受原记录。编号比较以
+// JSON 解码后实际表示的文字为准；交接关联的样品编号与历史说明中提到的交接
+// 编号只是关联或说明，不参与这项一致性判断。
+//
 // 样品的非空 PendingID 必须指向一条实际存在、尚未确认、且属于该样品的
 // 交接；每条尚未确认的交接也必须对应一份实际存在、且 PendingID 正好指向
 // 它的样品。待确认交接表示样品当前全部剩余量尚待指定人员接收，因此其
@@ -187,6 +195,9 @@ func validateRestored(l *ledger) error {
 		if rec == nil {
 			return fmt.Errorf("%w: 交接编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
 		}
+		if err := validateTransferIDConsistency(id, rec); err != nil {
+			return err
+		}
 		if rec.Confirmed {
 			sample, ok := l.Samples[rec.SampleID]
 			switch {
@@ -243,6 +254,56 @@ func quoteAll(ids []string) []string {
 		out[i] = fmt.Sprintf("%q", id)
 	}
 	return out
+}
+
+// validateTransferIDConsistency 核对一条交接在交接集合中的编号（map 键）与
+// 记录自身保存的编号（rec.ID）是否是同一个非空编号。按交接编号查询记录、
+// 样品的待确认详情与相同交出请求返回的编号分别取自这两处：两处不同或任一
+// 处不符合“去首尾空白后保存”的约定时，按集合编号查到的记录会显示另一个
+// 编号，再按显示的编号却查不到这条交接，数据自相矛盾，必须整份拒绝恢复。
+// 待确认交接与已确认交接适用同一规则。
+//
+// 两处编号都必须非空、不能只含空白、且不含首尾空白（交接编号一律按去首尾
+// 空白后的文字保存，见 Handover 的 trimRequired）；两处各自合法时文字还
+// 必须完全相同。编号比较以 JSON 解码后实际表示的文字为准：集合键与 rec.ID
+// 都已是解码后的字符串，把同一文字直接写出与写成合法 Unicode 转义视为同
+// 一编号，不会因此拒绝合法文件。交接关联的样品编号、保管历史说明中提到的
+// 交接编号都只是关联或说明文字，不参与本核对。
+//
+// 任一不符都返回包装了 ErrInvalid 的错误，信息写明集合中的编号、记录自身
+// 保存的编号与具体原因（记录缺少自身编号、编号为空或只有空白、保存的编号
+// 含有首尾空白、或两个非空编号文字不同），末尾统一带“，无法恢复”；绝不
+// 通过补填编号、去掉空白、把记录挪到另一个编号下或挑选其中一处来接受原
+// 记录。
+func validateTransferIDConsistency(collectionID string, rec *transferRecord) error {
+	const msgTail = "，无法恢复"
+	switch {
+	case rec.ID == "":
+		return fmt.Errorf("%w: 交接在集合中的编号为 %q，但记录自身缺少交接编号，集合中的编号与记录自身保存的编号必须是同一个非空编号%s",
+			ErrInvalid, collectionID, msgTail)
+	case strings.TrimSpace(rec.ID) == "":
+		return fmt.Errorf("%w: 交接在集合中的编号为 %q，但记录自身保存的交接编号 %q 只有空白，集合中的编号与记录自身保存的编号必须是同一个非空编号%s",
+			ErrInvalid, collectionID, rec.ID, msgTail)
+	case rec.ID != strings.TrimSpace(rec.ID):
+		return fmt.Errorf("%w: 交接在集合中的编号为 %q，但记录自身保存的交接编号 %q 含有首尾空白，交接编号按去首尾空白后的文字保存%s",
+			ErrInvalid, collectionID, rec.ID, msgTail)
+	}
+	switch {
+	case collectionID == "":
+		return fmt.Errorf("%w: 交接记录自身保存的编号为 %q，但它在集合中的编号为空，集合中的编号与记录自身保存的编号必须是同一个非空编号%s",
+			ErrInvalid, rec.ID, msgTail)
+	case strings.TrimSpace(collectionID) == "":
+		return fmt.Errorf("%w: 交接记录自身保存的编号为 %q，但它在集合中的编号 %q 只有空白，集合中的编号与记录自身保存的编号必须是同一个非空编号%s",
+			ErrInvalid, rec.ID, collectionID, msgTail)
+	case collectionID != strings.TrimSpace(collectionID):
+		return fmt.Errorf("%w: 交接记录自身保存的编号为 %q，但它在集合中的编号 %q 含有首尾空白，交接编号按去首尾空白后的文字保存%s",
+			ErrInvalid, rec.ID, collectionID, msgTail)
+	}
+	if collectionID != rec.ID {
+		return fmt.Errorf("%w: 交接在集合中的编号 %q 与记录自身保存的编号 %q 不一致，两处必须是同一个非空编号，不能按其中任何一处恢复%s",
+			ErrInvalid, collectionID, rec.ID, msgTail)
+	}
+	return nil
 }
 
 // validateActiveQuantities 核对一份没有销毁信息（即未销毁）的样品数量是否
