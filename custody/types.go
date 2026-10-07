@@ -168,18 +168,23 @@ func newLedger() *ledger {
 // 两个同名字段时，标准库更是只保留最后一个字段的整张 map——仅靠解码后的
 // map 既发现不了跨字段重复，还会丢掉先前字段保存的数量、保管信息或接收事实。
 //
-// 因此 samples 与 transfers 字段分别交给 samplesDecoder 与 transfersDecoder
-// 逐个字段解码（见各自文档，两者共用同一套键级判重规则）：
+// 因此 samples 与 transfers 字段分别由 samplesDecoder 与 transfersDecoder
+// 逐个字段解码，但两者不再各自维护编号检查、空集合处理与同名集合的记录合并：
+// 这些共同逻辑只有一份实现（见 collectionDecoder.mergeField），由两个集合共用，
+// 样品与交接各自只保留“这是什么集合、重复时如何报错”的类型含义：
 //   - 每个同名字段都在原始 JSON 上做一次键级扫描，编号按 JSON 解码后实际
 //     表示的文字比较（合法 Unicode 转义与直接写出同一文字视为同一编号）；
-//     判重集合跨所有同名字段共享，所以同一编号无论是在一个字段内出现两次，
-//     还是分处两个同名字段、中间隔着其他顶层字段或其他编号的条目，都按
-//     重复处理；
-//   - 一旦重复，无论两条内容是否完全相同、是否指向同一样品、确认状态
-//     如何，都返回包装了 ErrInvalid 的错误，写明重复的编号以及
-//     “同一编号出现多次”的原因；
+//     判重集合在同一类型的所有同名字段之间共享，所以同一编号无论是在一个字段内
+//     出现两次，还是分处两个同名字段、中间隔着其他顶层字段或其他编号的条目，
+//     都按重复处理；样品与交接各自维护判重集合，两类集合碰巧使用相同文字不构成
+//     跨类型重复；
+//   - 一旦重复，无论两条内容是否完全相同、是否指向同一样品、确认状态如何、
+//     其中一条是否为 null，都由对应集合自己的报错函数返回包装了 ErrInvalid
+//     的错误，写明重复的编号以及“同一编号出现多次”的原因；
 //   - 没有重复时，多个同名字段中的记录合并进同一张表，不同编号分别只
-//     出现在不同字段中仍能按编号查询，不因字段重名而误判冲突。
+//     出现在不同字段中仍能按编号查询，不因字段重名而误判冲突；后出现的空
+//     对象或 null 不并入任何记录，前面字段已经保存的数量、保管信息或接收事实
+//     不会被清空。
 //
 // 扫描只统计集合对象自身的键，值整体跳过，所以子样来源、子样列表、交接
 // 关联、保管历史说明或其他字段值文字中提到某编号不会被当作重复键。
@@ -198,88 +203,90 @@ func (l *ledger) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
-// samplesDecoder 逐字段接收文件顶层每一个 samples 值。encoding/json
-// 对结构体值字段实现的 Unmarshaler 只保留一个实例，每个同名字段都在同一
-// 实例上调用一次 UnmarshalJSON（即使该值是 null），因此 seen 与 records
-// 可以跨所有同名 samples 字段累积：唯一性检查覆盖整份文件的全部样品
-// 集合，不重复的记录则逐字段合并，避免标准库“重复字段只保留最后一个
-// 值”丢失前一个集合的样品。字段完全缺省时不会被调用，records 为 nil。
-type samplesDecoder struct {
-	records map[string]*sampleRecord
+// collectionDecoder 逐字段接收文件顶层每一个同名集合值，是样品集合与交接
+// 集合共用的读取逻辑的唯一实现。encoding/json 对结构体值字段实现的
+// Unmarshaler 只保留一个实例，每个同名字段都在同一实例上调用一次
+// UnmarshalJSON（即使该值是 null），因此 seen 与 records 可以跨所有同名字段
+// 累积：唯一性检查覆盖整份文件中该类型的全部集合，不重复的记录则逐字段合并，
+// 避免标准库“重复字段只保留最后一个值”丢失前一个集合里的记录。字段完全
+// 缺省时不会被调用，records 为 nil；样品与交接分别使用各自独立的实例，
+// 判重与合并互不影响。
+type collectionDecoder[T any] struct {
+	records map[string]*T
 	seen    map[string]struct{}
 }
 
-// UnmarshalJSON 处理单个 samples 字段值：先用标准解码完成语法、类型与
-// 记录字段校验（null 解码为空表，数组或标量按标准类型错误拒绝），再在
-// 原始 JSON 上按键扫描做唯一性判断，最后把该字段的记录并入总表。
-func (sd *samplesDecoder) UnmarshalJSON(data []byte) error {
-	var next map[string]*sampleRecord
+// mergeField 处理单个同名字段值，样品集合与交接集合共用同一份实现：
+//   - 先用标准解码完成语法、类型与记录字段校验：null 与空对象解码为空表，
+//     数组或标量按标准类型错误拒绝，单条记录为 null 时保留为表中的 nil
+//     条目（损坏数据处理仍由后续 validateRestored 负责）；
+//   - 再在原始 JSON 上按键扫描做唯一性判断（见 repeatedKey），编号按 JSON
+//     解码后实际表示的文字比较，判重集合跨该类型的全部同名字段共享；发现
+//     重复时不挑选、不覆盖、不合并，直接交回 duplicateErr 渲染成该集合自己
+//     的 ErrInvalid 说明，整份文件因此打开失败；
+//   - 最后把该字段的记录并入总表：空对象或 null 没有任何记录，直接保留
+//     先前字段的结果不清空；非空字段逐条并入，不同编号跨字段全部保留。
+//
+// duplicateErr 只负责按集合含义写出各自的报错说明（样品写明数量与保管信息，
+// 交接写明接收事实或待确认信息），判重、空集合与合并规则本身不在两处分别
+// 维护。
+func (d *collectionDecoder[T]) mergeField(data []byte, duplicateErr func(dupID string) error) error {
+	var next map[string]*T
 	if err := json.Unmarshal(data, &next); err != nil {
 		return err
 	}
-	if sd.seen == nil {
-		sd.seen = make(map[string]struct{})
+	if d.seen == nil {
+		d.seen = make(map[string]struct{})
 	}
-	dup, err := repeatedKey(data, sd.seen)
+	dup, err := repeatedKey(data, d.seen)
 	if err != nil {
 		return err
 	}
 	if dup != "" {
+		return duplicateErr(dup)
+	}
+	if len(next) == 0 {
+		return nil
+	}
+	if d.records == nil {
+		d.records = make(map[string]*T, len(next))
+	}
+	for k, v := range next {
+		d.records[k] = v
+	}
+	return nil
+}
+
+// samplesDecoder 逐字段接收文件顶层每一个 samples 值；字段处理规则全部由内嵌
+// 的 collectionDecoder 统一维护，这里只保留样品集合自己的重复报错说明。
+type samplesDecoder struct {
+	collectionDecoder[sampleRecord]
+}
+
+// UnmarshalJSON 处理单个 samples 字段值：共同逻辑完成类型校验、编号判重与
+// 跨字段合并；编号重复时按样品语义报错，写明无法确定应保留哪一份数量与保管
+// 信息。
+func (sd *samplesDecoder) UnmarshalJSON(data []byte) error {
+	return sd.mergeField(data, func(dup string) error {
 		return fmt.Errorf("%w: 样品编号 %q 在样品集合中出现多次，同一样品编号在整份本地数据中只能对应一条样品记录；重复编号无法确定应保留哪一份数量与保管信息，无法恢复",
 			ErrInvalid, dup)
-	}
-	if len(next) == 0 {
-		return nil
-	}
-	if sd.records == nil {
-		sd.records = make(map[string]*sampleRecord, len(next))
-	}
-	for k, v := range next {
-		sd.records[k] = v
-	}
-	return nil
+	})
 }
 
-// transfersDecoder 逐字段接收文件顶层每一个 transfers 值。encoding/json
-// 对结构体值字段实现的 Unmarshaler 只保留一个实例，每个同名字段都在同一
-// 实例上调用一次 UnmarshalJSON（即使该值是 null），因此 seen 与 records
-// 可以跨所有同名 transfers 字段累积：唯一性检查覆盖整份文件的全部交接
-// 集合，不重复的记录则逐字段合并，避免标准库“重复字段只保留最后一个
-// 值”丢失前一个集合的记录。字段完全缺省时不会被调用，records 为 nil。
+// transfersDecoder 逐字段接收文件顶层每一个 transfers 值；字段处理规则全部由
+// 内嵌的 collectionDecoder 统一维护，这里只保留交接集合自己的重复报错说明。
 type transfersDecoder struct {
-	records map[string]*transferRecord
-	seen    map[string]struct{}
+	collectionDecoder[transferRecord]
 }
 
-// UnmarshalJSON 处理单个 transfers 字段值：先用标准解码完成语法、类型与
-// 记录字段校验（null 解码为空表，数组或标量按标准类型错误拒绝），再在
-// 原始 JSON 上按键扫描做唯一性判断，最后把该字段的记录并入总表。
+// UnmarshalJSON 处理单个 transfers 字段值：共同逻辑完成类型校验、编号判重与
+// 跨字段合并；编号重复时按交接语义报错，写明无法确定应保留哪一条接收事实或
+// 待确认信息。
 func (t *transfersDecoder) UnmarshalJSON(data []byte) error {
-	var next map[string]*transferRecord
-	if err := json.Unmarshal(data, &next); err != nil {
-		return err
-	}
-	if t.seen == nil {
-		t.seen = make(map[string]struct{})
-	}
-	dup, err := repeatedKey(data, t.seen)
-	if err != nil {
-		return err
-	}
-	if dup != "" {
+	return t.mergeField(data, func(dup string) error {
 		return fmt.Errorf("%w: 交接编号 %q 在交接集合中出现多次，同一交接编号在整份本地数据中只能对应一条交接记录；重复编号无法确定应保留哪一条接收事实或待确认信息，无法恢复",
 			ErrInvalid, dup)
-	}
-	if len(next) == 0 {
-		return nil
-	}
-	if t.records == nil {
-		t.records = make(map[string]*transferRecord, len(next))
-	}
-	for k, v := range next {
-		t.records[k] = v
-	}
-	return nil
+	})
 }
 
 // repeatedKey 扫描一个集合对象值（samples 或 transfers 的字段值），把解码后
