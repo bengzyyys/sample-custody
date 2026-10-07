@@ -115,7 +115,11 @@ func Open(path string) (*Store, error) {
 // 超过该样品自身的初始量（见 validateConfirmedReceipt），并保留有效的
 // 接收信息：确认人非空且与该交接原先指定的接收人一致，接收时间存在且
 // 非零，且按实际时刻不早于交出时间（恰好相等合法，时区只影响表示）。
-// 集合中占用编号却为 null 的条目视为损坏，不能当作记录不存在。任一问题
+// 集合中占用编号却为 null 的条目视为损坏，不能当作记录不存在。每条非 null
+// 交接还必须先通过编号一致性核对（见 validateTransferIDAgreement）：它在
+// 交接集合中的编号与记录自身保存的编号必须是同一个非空、不含首尾空白的
+// 编号；记录缺少自身编号、自身编号为空或只有空白、带首尾空白、或两处编号
+// 文字不同都拒绝恢复，不补填、不去空白、不挪号、不挑选其中一处。任一问题
 // 都使整个文件无法恢复，绝不只加载其中一部分，也不改动原文件。
 func validateRestored(l *ledger) error {
 	sampleIDs := make([]string, 0, len(l.Samples))
@@ -186,6 +190,13 @@ func validateRestored(l *ledger) error {
 		rec := l.Transfers[id]
 		if rec == nil {
 			return fmt.Errorf("%w: 交接编号 %q 已被占用但记录为 null，无法恢复", ErrInvalid, id)
+		}
+		// 先核对集合中的编号与记录自身保存的编号是同一个非空、无首尾空白的
+		// 编号（见 validateTransferIDAgreement）：查询按集合中的编号命中，
+		// 视图却显示记录自身的编号，两处不同会让按显示编号查不回这条交接。
+		// 待确认与已确认交接适用同一规则，因此放在状态分支之前。
+		if err := validateTransferIDAgreement(id, rec); err != nil {
+			return err
 		}
 		if rec.Confirmed {
 			sample, ok := l.Samples[rec.SampleID]
@@ -910,6 +921,60 @@ func validatePendingContent(sampleID string, sample *sampleRecord, tr *transferR
 	case tr.Qty != sample.Remaining:
 		return fmt.Errorf("%w: 样品 %q 的待确认交接 %q 的交接量 %s 毫升与样品当前剩余量 %s 毫升不一致，无法恢复",
 			ErrInvalid, sampleID, tr.ID, formatUnits(tr.Qty), formatUnits(sample.Remaining))
+	}
+	return nil
+}
+
+// validateTransferIDAgreement 核对一条交接在交接集合中的编号（keyID，即
+// transfers 表里这条记录占用的键）与记录自身保存的编号（rec.ID）是否为
+// 同一个非空、不含首尾空白的编号。按交接编号查询以集合中的编号命中，而
+// 查询结果、样品待确认详情与相同交出请求返回的编号都取自记录自身，两处
+// 不同会让按返回编号反而查不到这条交接，因此重新打开时必须拒绝：
+//   - 记录缺少自身编号（JSON 中没有 id 字段）：按编号缺失拒绝；
+//   - 自身编号为空或只有空白：按编号为空/空白拒绝；
+//   - 自身编号带有首尾空白：发起交接时编号一律去首尾空白后保存，落盘记录
+//     不可能带着空白，这类文件只能是损坏数据，按编号含有首尾空白拒绝，
+//     绝不替它去掉空白后接受；
+//   - 两个非空编号的文字不同：按两处编号不一致拒绝，绝不通过补填编号、
+//     挪到另一个编号下或挑选其中一处来接受原记录。
+//
+// 比较以 JSON 解码后实际表示的文字为准：同一文字直接写出与经合法 Unicode
+// 转义写出在解码后没有区别，不会因此拒绝合法文件。交接中的样品编号、保管
+// 历史说明中提到的交接编号只是关联或说明，不参与这两处编号的一致性判断。
+// 集合中的编号同样必须非空且不含首尾空白（JSON 对象键允许空串或带空白的
+// 字符串，这类键不符合交接编号去首尾空白后保存的约定）。任一不符都返回
+// 包装了 ErrInvalid 的错误，信息写明集合中的编号、记录自身保存的编号与
+// 具体原因，让调用方能区分编号缺失（或空、空白、含首尾空白）与两个非空
+// 编号不一致；某一侧没有可显示的非空编号时用空引号占位说明。
+func validateTransferIDAgreement(keyID string, rec *transferRecord) error {
+	const msgTail = "，无法恢复"
+	switch {
+	case keyID == "":
+		return fmt.Errorf("%w: 交接集合中的编号为空字符串（对应记录自身保存的编号为 %q），交接编号必须是非空且不含首尾空白的同一编号%s",
+			ErrInvalid, rec.ID, msgTail)
+	case strings.TrimSpace(keyID) == "":
+		return fmt.Errorf("%w: 交接集合中的编号 %q 只有空白（对应记录自身保存的编号为 %q），交接编号必须是非空且不含首尾空白的同一编号%s",
+			ErrInvalid, keyID, rec.ID, msgTail)
+	case keyID != strings.TrimSpace(keyID):
+		return fmt.Errorf("%w: 交接集合中的编号 %q 含有首尾空白（记录自身保存的编号为 %q），交接编号按约定去首尾空白后保存，不能带空白恢复%s",
+			ErrInvalid, keyID, rec.ID, msgTail)
+	}
+	switch {
+	case !rec.idPresent:
+		return fmt.Errorf("%w: 交接集合中的编号 %q 对应的交接记录缺少自身保存的编号（id 字段缺失），集合中的编号与记录自身编号必须是同一个非空编号%s",
+			ErrInvalid, keyID, msgTail)
+	case rec.ID == "":
+		return fmt.Errorf("%w: 交接集合中的编号 %q 对应的交接记录自身编号为空字符串，编号必须非空且不含首尾空白%s",
+			ErrInvalid, keyID, msgTail)
+	case strings.TrimSpace(rec.ID) == "":
+		return fmt.Errorf("%w: 交接集合中的编号 %q 对应的交接记录自身编号为 %q，编号只有空白，必须是非空且不含首尾空白的同一编号%s",
+			ErrInvalid, keyID, rec.ID, msgTail)
+	case rec.ID != strings.TrimSpace(rec.ID):
+		return fmt.Errorf("%w: 交接集合中的编号 %q 对应的交接记录自身保存的编号 %q 含有首尾空白，交接编号按约定去首尾空白后保存，不能带空白恢复%s",
+			ErrInvalid, keyID, rec.ID, msgTail)
+	case rec.ID != keyID:
+		return fmt.Errorf("%w: 交接集合中的编号 %q 与交接记录自身保存的编号 %q 不一致，两处必须是同一个非空编号，不能按其中一个编号接受原记录%s",
+			ErrInvalid, keyID, rec.ID, msgTail)
 	}
 	return nil
 }

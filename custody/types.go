@@ -144,6 +144,29 @@ type transferRecord struct {
 	Confirmed   bool       `json:"confirmed"`
 	ReceivedAt  *time.Time `json:"receivedAt,omitempty"`
 	ConfirmedBy string     `json:"confirmedBy,omitempty"`
+
+	// idPresent 记录 JSON 中是否实际写出了 id 字段。Go 的字符串字段无法区分
+	// “字段缺失”与“字段存在但为空字符串”，恢复核对（见
+	// validateTransferIDAgreement）需要把二者作为不同原因分别报错，因此由
+	// UnmarshalJSON 额外记录这一信息；它不参与序列化。
+	idPresent bool `json:"-"`
+}
+
+// UnmarshalJSON 在标准解码之外记录 id 字段是否实际写出。字段存在但为空与
+// 字段缺失必须区分：前者是“编号为空”，后者是“缺少自身编号”。先用一层
+// RawMessage 探测字段是否存在，再按原结构标准解码，语法、类型错误与未知
+// 字段处理都与标准库保持一致；该方法不改变任何已解码字段的值。
+func (t *transferRecord) UnmarshalJSON(data []byte) error {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	type plain transferRecord
+	if err := json.Unmarshal(data, (*plain)(t)); err != nil {
+		return err
+	}
+	_, t.idPresent = probe["id"]
+	return nil
 }
 
 // ledger 是一份本地样品数据的完整可序列化状态。
