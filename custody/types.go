@@ -1,7 +1,10 @@
 package custody
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -157,6 +160,138 @@ func newLedger() *ledger {
 		Samples:   make(map[string]*sampleRecord),
 		Transfers: make(map[string]*transferRecord),
 	}
+}
+
+// UnmarshalJSON 按现有格式解码一份本地样品数据，并在交接集合上额外保证
+// 交接编号唯一。transfers 是一个 JSON 对象，标准库把它解码进 map 时，
+// 同一键出现多次会静默用后一条覆盖前一条——仅靠解码后的 map 无法再发现
+// 这种重复，原先的接收事实或待确认信息可能因此丢失。因此解码前后各做
+// 一次：
+//   - 先按现有格式正常解码，缺省、null 或空对象的集合保持原有含义；
+//   - 再在原始 JSON 上做一次 token 级扫描（见 duplicateJSONKeys），只统计
+//     transfers 对象自身的键：一旦同一编号（按 JSON 解码后实际表示的文字
+//     比较，合法 Unicode 转义与直接写出同一文字视为同一编号）出现多次，
+//     无论两条记录相邻还是隔着其他交接、内容是否相同、确认状态如何，都
+//     返回包装了 ErrInvalid 的错误，并写明重复的交接编号以及“同一编号
+//     出现多次”的原因。
+//
+// 扫描只读取 transfers 对象的键，其值作为整体跳过，因此样品保管历史的
+// 说明、交接记录字段值或其他说明文字中再次提到某编号不会被当作重复键。
+// 原始扫描无法解析（正常解码也会失败）时同样中止，绝不带着重复编号恢复。
+func (l *ledger) UnmarshalJSON(raw []byte) error {
+	type plainLedger ledger
+	if err := json.Unmarshal(raw, (*plainLedger)(l)); err != nil {
+		return err
+	}
+
+	dup, err := duplicateJSONKeys(raw, "transfers")
+	if err != nil {
+		return err
+	}
+	if dup != "" {
+		return fmt.Errorf("%w: 交接编号 %q 在交接集合中出现多次，同一交接编号只能对应一条交接记录；重复编号无法确定应保留哪一条接收事实或待确认信息，无法恢复",
+			ErrInvalid, dup)
+	}
+	return nil
+}
+
+// duplicateJSONKeys 扫描一段对象 JSON，返回其中指定名字段（field）对应
+// 对象里重复出现的键。字段缺省、为 null 或为空对象时不存在重复，返回
+// 空字符串。比较基于 JSON 解码后实际表示的文字：Decoder.Token 返回的
+// 字符串键已完成 Unicode 反转义，所以 "TR-001" 与 "TR-001" 这类
+// 合法转义表示同一文字时会被判为同一键。
+//
+// 扫描只在目标对象内统计“键”，对象与数组的值都按括号配对整体跳过，
+// 不读取其中任何字符串内容——因此写在字段值、保管历史说明等位置的编号
+// 文本不会被当作键统计。顶层其他字段的内容同样整体跳过。返回的重复键
+// 取按实际文字判重时第一个再次出现的键；扫描过程中一旦 JSON 无法解析
+// 即返回该错误。
+func duplicateJSONKeys(raw []byte, field string) (string, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// 进入顶层对象。
+	if tok, err := dec.Token(); err != nil {
+		return "", err
+	} else if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return "", fmt.Errorf("期望顶层为 JSON 对象")
+	}
+
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return "", err
+		}
+		key, _ := tok.(string)
+		if key != field {
+			if err := skipJSONValue(dec); err != nil {
+				return "", err
+			}
+			continue
+		}
+		// 找到目标字段：先取其起始 token，判断是否为对象。顶层出现多个
+		// 同名字段时逐一检查，避免被标准库“取最后一个”的语义绕过判重。
+		start, err := dec.Token()
+		if err != nil {
+			return "", err
+		}
+		d, ok := start.(json.Delim)
+		if !ok || d != '{' {
+			// null、标量或数组都不是对象，且该值已随上面的 Token 消费完毕。
+			continue
+		}
+		seen := make(map[string]struct{})
+		for dec.More() {
+			kt, err := dec.Token()
+			if err != nil {
+				return "", err
+			}
+			k := kt.(string)
+			if err := skipJSONValue(dec); err != nil {
+				return "", err
+			}
+			if _, exists := seen[k]; exists {
+				return k, nil
+			}
+			seen[k] = struct{}{}
+		}
+		// 消费目标对象的结束 '}'。
+		if _, err := dec.Token(); err != nil {
+			return "", err
+		}
+	}
+	// 消费顶层对象的结束 '}'。
+	if _, err := dec.Token(); err != nil {
+		return "", err
+	}
+	return "", nil
+}
+
+// skipJSONValue 跳过紧跟在一个键之后的值：标量已随下一次 Token 直接读出，
+// 对象或数组则按嵌套深度跳过其全部内容（JSON 解码保证分界符正确配对）。
+// 调用方必须刚读出键、尚未读取值。
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if _, ok := tok.(json.Delim); !ok {
+		return nil // 标量值（字符串、数字、布尔、null）。
+	}
+	depth := 1
+	for depth > 0 {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if td, ok := t.(json.Delim); ok {
+			switch td {
+			case '{', '[':
+				depth++
+			default: // '}' 或 ']'
+				depth--
+			}
+		}
+	}
+	return nil
 }
 
 // deepCopy 复制整份状态。所有写操作都在拷贝上完成校验与修改，
