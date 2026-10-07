@@ -81,9 +81,10 @@ func Open(path string) (*Store, error) {
 // 样品的量。样品是否挂着待确认交接不影响这项检查：即使待确认交接量恰好
 // 等于错误的剩余量，数量越界的样品也必须拒绝（见 validateActiveQuantities）。
 //
-// 对带有销毁信息的样品，先核对销毁时间（见 validateDestroyedTime）：销毁
+// 对带有销毁信息的样品，先核对销毁时间（见 checkDestroyTime）：销毁
 // 时间缺失或为零值一律拒绝（与是否有保管历史无关），且按实际时刻不得早于
-// 该样品自身任何一条保管历史的发生时刻；随后逐一核对数量守恒（见
+// 该样品自身任何一条保管历史的发生时刻；该时间规则与发起销毁（见 Destroy）
+// 共用同一份实现；随后逐一核对数量守恒（见
 // validateDestroyedQuantity）：
 // 当前剩余量必须为 0.000，实际销毁量与自身初始量都大于零，且实际销毁量
 // 加上各直接子样创建时取得的初始量之和恰好等于该样品自身的初始量。参与
@@ -163,8 +164,10 @@ func validateRestored(l *ledger) error {
 		// 销毁核对放在待确认交接核对之后：已销毁样品仍挂着待确认交接
 		// 本身就是损坏，沿用原有的交接恢复报错，保持与既有交接检查的兼容。
 		if rec.Destroyed != nil {
-			if err := validateDestroyedTime(id, rec); err != nil {
-				return err
+			// 销毁时间规则只有一份实现（见 checkDestroyTime），与发起销毁
+			// 共用；这里按恢复失败的语义渲染为 ErrInvalid。
+			if prob := checkDestroyTime(rec.Destroyed.At, rec.History); prob != nil {
+				return prob.asRestoreError(id, rec.Destroyed.At)
 			}
 			if err := validateDestroyedQuantity(id, rec, l); err != nil {
 				return err
@@ -313,8 +316,33 @@ func validateActiveQuantities(sampleID string, rec *sampleRecord, l *ledger) err
 	return nil
 }
 
-// validateDestroyedTime 核对一份带销毁信息的样品记录其销毁时间是否成立，
-// 与正常销毁功能（Destroy）的时间规则保持一致：
+// destroyTimeProblemKind 标识销毁时间核对（见 checkDestroyTime）发现的问题
+// 类型。同一份时间规则只有这一份实现，由发起销毁（见 Destroy）与重新打开
+// 已销毁记录（见 validateRestored）共用；两个入口再按各自的失败语义把问题
+// 渲染成原有分类与说明（见 asDestroyTimeError 与 asRestoreError）。
+type destroyTimeProblemKind int
+
+const (
+	// destroyTimeMissing：销毁时间缺失或为零值。即使样品没有任何保管历史
+	// 也一样拒绝。
+	destroyTimeMissing destroyTimeProblemKind = iota
+	// destroyTimeBeforeHistory：销毁时间按实际时刻早于该样品自身某条保管
+	// 历史的发生时刻。冲突历史的时间保存在 conflictAt 中，便于报错定位。
+	destroyTimeBeforeHistory
+)
+
+// destroyTimeProblem 描述一次销毁时间核对发现的问题，是 checkDestroyTime
+// 的唯一失败结果形式。conflictKind 与 conflictAt 仅在
+// destroyTimeBeforeHistory 时使用，分别保存与之冲突的那条保管历史的类型
+// 与时间，供恢复入口按原措辞在错误中定位。
+type destroyTimeProblem struct {
+	kind         destroyTimeProblemKind
+	conflictKind string
+	conflictAt   time.Time
+}
+
+// checkDestroyTime 核对销毁时间是否成立，是销毁时间规则的唯一实现，发起
+// 销毁与重新打开已销毁记录两个入口都只维护这一份：
 //   - 销毁时间必须存在且非零值：缺失或零值一律拒绝，即使该样品没有任何
 //     保管历史也一样；
 //   - 销毁时间按实际时刻不得早于该样品自身任何一条保管历史的发生时刻
@@ -325,23 +353,47 @@ func validateActiveQuantities(sampleID string, rec *sampleRecord, l *ledger) err
 // 却带着更早的时刻），因此逐条核对全部历史，而不是只比较末尾一条。这里
 // 只看该编号样品自己的历史：已经分出的子样或同一份数据中其他样品后来
 // 发生的交接，都不延后本样品可以销毁的时间；分装子样也按自己的历史判断。
-// 核对只读取历史，绝不因核对而重排或改写记录。任一不符都返回包装了
-// ErrInvalid 的错误，信息写明样品编号；发生时间倒置时同时给出销毁时间
-// 与冲突历史的时间，便于定位记录。
-func validateDestroyedTime(sampleID string, rec *sampleRecord) error {
-	at := rec.Destroyed.At
+// 核对只读取历史，绝不因核对而重排或改写记录。
+func checkDestroyTime(at time.Time, history []historyRecord) *destroyTimeProblem {
 	if at.IsZero() {
-		return fmt.Errorf("%w: 样品 %q 的销毁时间缺失或为零值，无法恢复",
-			ErrInvalid, sampleID)
+		return &destroyTimeProblem{kind: destroyTimeMissing}
 	}
-	for _, h := range rec.History {
+	for _, h := range history {
 		if at.Before(h.Time) {
-			return fmt.Errorf("%w: 样品 %q 的销毁时间 %s 早于已有保管历史（%s）的时间 %s，无法恢复",
-				ErrInvalid, sampleID,
-				at.Format(time.RFC3339), h.Kind, h.Time.Format(time.RFC3339))
+			return &destroyTimeProblem{
+				kind:         destroyTimeBeforeHistory,
+				conflictKind: h.Kind,
+				conflictAt:   h.Time,
+			}
 		}
 	}
 	return nil
+}
+
+// asRestoreError 按“重新打开已销毁记录失败”的语义把销毁时间问题渲染为
+// 包装了 ErrInvalid 的错误：信息写明样品编号；发生时间倒置时同时给出销毁
+// 时间与冲突历史的时间，便于定位记录。措辞与历史可观察结果保持一致。
+func (p *destroyTimeProblem) asRestoreError(sampleID string, at time.Time) error {
+	switch p.kind {
+	case destroyTimeMissing:
+		return fmt.Errorf("%w: 样品 %q 的销毁时间缺失或为零值，无法恢复",
+			ErrInvalid, sampleID)
+	default: // destroyTimeBeforeHistory
+		return fmt.Errorf("%w: 样品 %q 的销毁时间 %s 早于已有保管历史（%s）的时间 %s，无法恢复",
+			ErrInvalid, sampleID,
+			at.Format(time.RFC3339), p.conflictKind, p.conflictAt.Format(time.RFC3339))
+	}
+}
+
+// asDestroyTimeError 按“发起销毁时入参非法”的语义把销毁时间问题渲染为
+// 包装了 ErrInvalid 的错误：信息写明样品编号与冲突历史的时间。时间缺失
+// 的说明在调用方入口处仍按原样给出（见 Destroy 的“销毁时间不能为空”）。
+// 措辞与历史可观察结果保持一致。
+func (p *destroyTimeProblem) asDestroyTimeError(sampleID string) error {
+	// 发起销毁的零值时间在 Destroy 入口处单独说明（“销毁时间不能为空”），
+	// 能走到这里的只有时间倒置。
+	return fmt.Errorf("%w: 销毁时间不能早于样品 %q 已有保管历史的时间 %s",
+		ErrInvalid, sampleID, p.conflictAt.Format(time.RFC3339))
 }
 
 // childRelationshipProblemKind 标识直接子样关系矛盾的具体类型。
@@ -1465,11 +1517,12 @@ func (s *Store) Destroy(in DestroyInput) (*Sample, error) {
 	if err := validateDestroyConservation(sampleID, rec, s.data); err != nil {
 		return nil, err
 	}
-	for _, h := range rec.History {
-		if at.Before(h.Time) {
-			return nil, fmt.Errorf("%w: 销毁时间不能早于样品 %q 已有保管历史的时间 %s",
-				ErrInvalid, sampleID, h.Time.Format(time.RFC3339))
-		}
+	// 销毁时间规则与重新打开已销毁记录时的恢复核对共用同一份实现（见
+	// checkDestroyTime），两处不再分别维护：零值时间已在入口处按“销毁
+	// 时间不能为空”拒绝，这里只需处理时间倒置，按销毁入参非法的语义
+	// 渲染为 ErrInvalid。
+	if prob := checkDestroyTime(at, rec.History); prob != nil {
+		return nil, prob.asDestroyTimeError(sampleID)
 	}
 
 	candidate := s.data.deepCopy()
